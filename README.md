@@ -218,9 +218,6 @@ MIT License
 ## 作者
 
 gjp
-
-## 赞助
-![Token 使用统计](assets/donate_image.jpg)
 ---
 
 **注意**: 首次运行时，工具会以占位模式启动，请编辑相应的配置文件后重启服务。
