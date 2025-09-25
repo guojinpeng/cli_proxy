@@ -59,10 +59,12 @@ venv.bak/
 .idea/
 .vscode/
 .claude/
+CLAUDE.md
+AGENTS.md
 *.swp
 *.swo
 *~
-
+.serena/
 # OS generated files
 .DS_Store
 .DS_Store?

@@ -1,0 +1,27 @@
+# VCS & metadata
+.git
+.gitignore
+.serena
+
+# Python caches
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Envs
+.venv
+venv
+
+# Build artifacts
+dist
+build
+*.egg-info
+
+# Not needed for runtime
+assets
+tests
+node_modules
+.DS_Store
+clp_data
