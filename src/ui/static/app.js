@@ -323,9 +323,8 @@ const app = createApp({
             if (service === 'claude') {
                 return [
                     { label: 'claude-sonnet-4', value: 'claude-sonnet-4-20250514' },
-                    { label: 'claude-opus-4-1', value: 'claude-opus-4-1-20250805' },
                     { label: 'claude-opus-4', value: 'claude-opus-4-20250514' },
-                    { label: 'claude-3-5-haiku', value: 'claude-3-5-haiku-20241022' }
+                    { label: 'claude-opus-4-1', value: 'claude-opus-4-1-20250805' }
                 ];
             } else if (service === 'codex') {
                 return [
