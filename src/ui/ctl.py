@@ -5,7 +5,7 @@ import signal
 import time
 import subprocess
 from pathlib import Path
-from .ui_server import app
+from .ui_server import app, ensure_ui_security_bootstrap
 from ..utils.platform_helper import is_process_running, kill_process, create_detached_process
 
 # UI服务配置
@@ -42,6 +42,12 @@ def start_daemon(port=DEFAULT_PORT):
 
     # 确保配置目录存在
     CONFIG_DIR.mkdir(exist_ok=True)
+
+    # 启动前安全初始化（默认管理员、JWT密钥、启用UI鉴权）
+    try:
+        ensure_ui_security_bootstrap(print)
+    except Exception as e:
+        print(f"[auth] 启动前安全初始化失败: {e}")
 
     try:
         # 启动方式改为使用生产级WSGI服务器

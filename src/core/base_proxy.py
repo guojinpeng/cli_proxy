@@ -5,8 +5,11 @@
 """
 import asyncio
 import base64
+import hmac
+import hashlib
 import json
 import subprocess
+import os
 import sys
 import time
 import uuid
@@ -103,6 +106,256 @@ class BaseProxyService(ABC):
         """FastAPI 关闭事件，释放HTTP客户端资源"""
         await self.client.aclose()
 
+    def _get_auth_mode(self) -> int:
+        """读取鉴权模式：0关闭，1全部，2仅UI，3仅codex，4仅claude。
+
+        来源优先级：环境变量 CLP_AUTH_MODE > 文件 ~/.clp/auth_config.json {"mode": N}
+        无配置默认 0。
+        """
+        import os
+        try:
+            val = os.environ.get('CLP_AUTH_MODE')
+            if val is not None:
+                return int(val)
+        except Exception:
+            pass
+        try:
+            cfg = Path.home() / '.clp' / 'auth_config.json'
+            if cfg.exists():
+                with open(cfg, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                m = data.get('mode')
+                if isinstance(m, int):
+                    return m
+        except Exception:
+            pass
+        return 0
+
+    def _is_auth_required_for_proxy(self) -> bool:
+        # 支持列表配置 enabled: ["ui","codex","claude"]
+        try:
+            cfg = Path.home() / '.clp' / 'auth_config.json'
+            if cfg.exists():
+                with open(cfg, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                enabled = data.get('enabled')
+                if isinstance(enabled, list):
+                    return self.service_name in enabled
+        except Exception:
+            pass
+        # 兼容旧 mode 数值
+        mode = self._get_auth_mode()
+        if mode == 1:
+            return True
+        if mode == 3 and self.service_name == 'codex':
+            return True
+        if mode == 4 and self.service_name == 'claude':
+            return True
+        return False
+
+    def _is_ui_auth_required_globally(self) -> bool:
+        """是否开启 UI 鉴权（作为全局 WS 鉴权开关）。
+
+        规则：优先读取 auth_config.json 中 enabled 列表是否包含 'ui'；
+        若没有该列表，则回退旧的 mode 数值，mode in (1,2) 视为 UI 鉴权开启。
+        """
+        try:
+            cfg = Path.home() / '.clp' / 'auth_config.json'
+            if cfg.exists():
+                with open(cfg, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                enabled = data.get('enabled')
+                if isinstance(enabled, list):
+                    return 'ui' in enabled
+        except Exception:
+            pass
+        mode = self._get_auth_mode()
+        return mode in (1, 2)
+
+    def _get_proxy_credentials(self) -> Tuple[Optional[str], Optional[str]]:
+        """获取代理自定义凭证（互斥语义）。
+
+        规则：
+        - 当 proxy.separate 为 True（分开鉴权）：仅接受服务级凭证；不使用共享凭证回退。
+          优先环境变量 CLP_PROXY_<SERVICE>_AUTH_TOKEN/_API_KEY，其次读取文件 proxy.<service>.keys。
+        - 当 proxy.separate 为 False（使用共享）：仅接受共享凭证；忽略服务级与环境变量。
+
+        返回 (auth_token, api_key)。若均未配置，返回 (None, None)。
+        """
+        import os
+        # 读取 separate 标志
+        separate = False
+        try:
+            unified = Path.home() / '.clp' / 'auth_config.json'
+            if unified.exists():
+                data = json.loads(unified.read_text(encoding='utf-8') or '{}')
+                separate = bool((data.get('proxy') or {}).get('separate'))
+        except Exception:
+            separate = False
+
+        if separate:
+            # 分开鉴权：仅服务级凭证
+            service_upper = self.service_name.upper()
+            env_token = os.environ.get(f"CLP_PROXY_{service_upper}_AUTH_TOKEN")
+            env_key = os.environ.get(f"CLP_PROXY_{service_upper}_API_KEY")
+            if env_token or env_key:
+                return env_token, env_key
+
+            try:
+                unified = Path.home() / '.clp' / 'auth_config.json'
+                if unified.exists():
+                    data = json.loads(unified.read_text(encoding='utf-8') or '{}')
+                    proxy = data.get('proxy') or {}
+                    svc = proxy.get(self.service_name) or {}
+                    keys = svc.get('keys') if isinstance(svc, dict) else None
+                    if isinstance(keys, list) and keys:
+                        val = None
+                        for k in keys:
+                            if isinstance(k, dict) and k.get('active') and isinstance(k.get('value'), str):
+                                val = k.get('value'); break
+                        if val is None and isinstance(keys[0], dict):
+                            val = keys[0].get('value')
+                        if isinstance(val, str):
+                            return val, val
+            except Exception:
+                pass
+            return None, None
+
+        # 使用共享鉴权：仅共享凭证
+        try:
+            unified = Path.home() / '.clp' / 'auth_config.json'
+            if unified.exists():
+                data = json.loads(unified.read_text(encoding='utf-8') or '{}')
+                proxy = data.get('proxy') or {}
+                shared = proxy.get('shared') or {}
+                if isinstance(shared, dict):
+                    skeys = shared.get('keys')
+                    if isinstance(skeys, list) and skeys:
+                        val = None
+                        for k in skeys:
+                            if isinstance(k, dict) and k.get('active') and isinstance(k.get('value'), str):
+                                val = k.get('value'); break
+                        if val is None and isinstance(skeys[0], dict):
+                            val = skeys[0].get('value')
+                        if isinstance(val, str):
+                            return val, val
+        except Exception:
+            pass
+        return None, None
+
+    def _is_authorized_request(self, request: Request) -> bool:
+        """校验HTTP请求鉴权，方式与上游转发保持一致。
+
+        - Authorization: Bearer <token>
+        - X-API-Key: <api_key>
+        - 对于 CORS 预检(OPTIONS)放行
+        - 当未开启本服务鉴权时放行
+        """
+        if request.method == 'OPTIONS':
+            return True
+        if not self._is_auth_required_for_proxy():
+            return True
+        token_expected, api_key_expected = self._get_proxy_credentials()
+        # 开启鉴权但未配置任何凭证 -> 拒绝
+        if not token_expected and not api_key_expected:
+            return False
+
+        accepted = set()
+        if token_expected:
+            accepted.add(token_expected)
+        if api_key_expected:
+            accepted.add(api_key_expected)
+
+        auth_header = request.headers.get('Authorization') or request.headers.get('authorization')
+        if isinstance(auth_header, str) and auth_header.lower().startswith('bearer '):
+            provided = auth_header[7:].strip()
+            if provided in accepted:
+                return True
+
+        provided_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
+        if isinstance(provided_key, str) and provided_key in accepted:
+            return True
+
+        return False
+
+
+    def _is_authorized_ws(self, websocket: WebSocket) -> bool:
+        """校验 WebSocket 连接鉴权。
+
+        策略：仅与 UI 鉴权保持一致。当 UI 未开启鉴权时放行；
+        当 UI 开启鉴权时，要求使用 UI 的 JWT（与 UI 面板一致），而非代理 token/api_key。
+        允许两种携带方式：
+        - Header: Authorization: Bearer <jwt>
+        - Query:  ?jwt=<jwt>
+        """
+        if not self._is_ui_auth_required_globally():
+            return True
+
+        # 读取 JWT（Cookie / Header / Query）
+        jwt_token = None
+        # Cookie
+        cookie_header = websocket.headers.get('cookie') or ''
+        if 'ui_jwt=' in cookie_header:
+            try:
+                parts = [p.strip() for p in cookie_header.split(';')]
+                kv = dict(p.split('=', 1) for p in parts if '=' in p)
+                jwt_token = kv.get('ui_jwt')
+            except Exception:
+                jwt_token = None
+        # Header
+        if not jwt_token:
+            ah = websocket.headers.get('authorization')
+            if isinstance(ah, str) and ah.lower().startswith('bearer '):
+                jwt_token = ah[7:].strip()
+        # Query
+        if not jwt_token:
+            jwt_token = websocket.query_params.get('jwt')
+        if not jwt_token:
+            return False
+
+        return self._verify_ui_jwt(jwt_token)
+
+    def _verify_ui_jwt(self, token: str) -> bool:
+        """验证来自 UI 的 JWT（HS256）。"""
+        try:
+            # 解析三段
+            parts = token.split('.')
+            if len(parts) != 3:
+                return False
+            header_b64, payload_b64, sig_b64 = parts
+
+            def _b64url_decode(data: str) -> bytes:
+                padding = '=' * (-len(data) % 4)
+                return base64.urlsafe_b64decode((data + padding).encode('ascii'))
+
+            signing_input = f"{header_b64}.{payload_b64}".encode('ascii')
+            # 优先从统一配置读取 ui_jwt_secret，其次环境变量，最后开发默认值
+            try:
+                cfg_path = Path.home() / '.clp' / 'auth_config.json'
+                secret_str = None
+                if cfg_path.exists():
+                    data = json.loads(cfg_path.read_text(encoding='utf-8') or '{}')
+                    s = data.get('ui_jwt_secret') or data.get('CLP_UI_JWT_SECRET')
+                    if isinstance(s, str) and s.strip():
+                        secret_str = s.strip()
+                if not secret_str:
+                    secret_str = os.environ.get('CLP_UI_JWT_SECRET') or 'clp-dev-secret'
+                secret = secret_str.encode('utf-8')
+            except Exception:
+                secret = (os.environ.get('CLP_UI_JWT_SECRET') or 'clp-dev-secret').encode('utf-8')
+            expected = hmac.new(secret, signing_input, hashlib.sha256).digest()
+            actual = _b64url_decode(sig_b64)
+            if not hmac.compare_digest(expected, actual):
+                return False
+
+            payload = json.loads(_b64url_decode(payload_b64))
+            exp = payload.get('exp')
+            if isinstance(exp, (int, float)) and time.time() > float(exp):
+                return False
+            return True
+        except Exception:
+            return False
+
     def _setup_routes(self):
         """设置API路由"""
         @self.app.api_route(
@@ -115,6 +368,12 @@ class BaseProxyService(ABC):
         @self.app.websocket("/ws/realtime")
         async def websocket_endpoint(websocket: WebSocket):
             """WebSocket实时事件端点"""
+            # 鉴权校验（与HTTP一致），失败以策略错误关闭
+            if not self._is_authorized_ws(websocket):
+                try:
+                    await websocket.close(code=1008)
+                finally:
+                    return
             await self.realtime_hub.connect(websocket)
             try:
                 # 保持连接活跃，等待客户端消息或断开
@@ -262,6 +521,10 @@ class BaseProxyService(ABC):
         """处理代理请求"""
         start_time = time.time()
         request_id = str(uuid.uuid4())
+
+        # 统一入口鉴权（与上游转发保持一致），放行OPTIONS
+        if not self._is_authorized_request(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
         original_headers = {k: v for k, v in request.headers.items()}
         original_body = await request.body()

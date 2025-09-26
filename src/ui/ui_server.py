@@ -3,7 +3,10 @@ import webbrowser
 import time
 from pathlib import Path
 from typing import Any, Dict
-from flask import Flask, jsonify, send_file, request
+from flask import Flask, jsonify, send_file, request, make_response
+import hmac
+import hashlib
+import base64
 import os
 
 from src.utils.usage_parser import (
@@ -30,6 +33,781 @@ if OLD_LOG_FILE.exists() and not LOG_FILE.exists():
         pass
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path='/static')
+
+# ---- UI 鉴权（账号密码 + JWT）----
+AUTH_FILE = Path.home() / '.clp' / 'auth_config.json'
+
+def _load_unified_config() -> Dict[str, Any]:
+    try:
+        if AUTH_FILE.exists():
+            return json.loads(AUTH_FILE.read_text(encoding='utf-8') or '{}')
+    except Exception:
+        pass
+    return {}
+
+def _save_unified_config(data: Dict[str, Any]) -> None:
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def _get_ui_jwt_secret() -> str:
+    """优先从统一配置读取 UI JWT 秘钥，其次环境变量，最后开发默认值。
+    同时兼容迁移期：如果配置未写入，建议在启动时调用 ensure_ui_security_bootstrap 写入随机密钥。
+    """
+    try:
+        cfg = _load_unified_config()
+        secret = cfg.get('ui_jwt_secret') or cfg.get('CLP_UI_JWT_SECRET')
+        if isinstance(secret, str) and secret.strip():
+            return secret.strip()
+    except Exception:
+        pass
+    return os.environ.get('CLP_UI_JWT_SECRET', 'clp-dev-secret')
+
+UI_JWT_SECRET = _get_ui_jwt_secret()
+
+def _hash_password(password: str, salt: bytes) -> str:
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 120000)
+    return base64.b64encode(dk).decode('ascii')
+
+def _verify_password(password: str, salt_b64: str, hash_b64: str) -> bool:
+    try:
+        salt = base64.b64decode(salt_b64.encode('ascii'))
+        calc = _hash_password(password, salt)
+        return hmac.compare_digest(calc, hash_b64)
+    except Exception:
+        return False
+
+def ensure_ui_security_bootstrap(print_fn=print) -> None:
+    """系统启动前的安全初始化：
+    - 若未持久化管理员，则写入默认管理员（admin/admin 或取环境变量）
+    - 若未配置 ui_jwt_secret，则生成随机密钥
+    - 默认启用 UI 鉴权（将 'ui' 加入 enabled）
+    - 打印命令行提示
+    """
+    try:
+        cfg = _load_unified_config()
+        changed = False
+        created_admin = False
+        created_secret = False
+        enabled_ui = False
+
+        # 1) 管理员
+        ua = cfg.get('ui_admin') or {}
+        if not (isinstance(ua, dict) and ua.get('username') and ua.get('password_hash') and ua.get('salt')):
+            username = os.environ.get('CLP_UI_USERNAME', 'admin')
+            password = os.environ.get('CLP_UI_PASSWORD', 'admin')
+            salt = os.urandom(16)
+            salt_b64 = base64.b64encode(salt).decode('ascii')
+            hash_b64 = _hash_password(password, salt)
+            cfg['ui_admin'] = {'username': username, 'password_hash': hash_b64, 'salt': salt_b64}
+            changed = True
+            created_admin = True
+
+        # 2) JWT secret
+        if not (isinstance(cfg.get('ui_jwt_secret'), str) and cfg.get('ui_jwt_secret').strip()):
+            # 32 bytes URL-safe base64 (no padding)
+            rnd = base64.urlsafe_b64encode(os.urandom(32)).decode('ascii').rstrip('=')
+            cfg['ui_jwt_secret'] = rnd
+            changed = True
+            created_secret = True
+
+        # 3) 启用 UI 鉴权
+        enabled = cfg.get('enabled')
+        if isinstance(enabled, list):
+            if 'ui' not in enabled:
+                enabled.append('ui')
+                changed = True
+                enabled_ui = True
+        else:
+            cfg['enabled'] = ['ui']
+            changed = True
+            enabled_ui = True
+
+        if changed:
+            _save_unified_config(cfg)
+            # 更新进程内 JWT 秘钥缓存
+            global UI_JWT_SECRET
+            UI_JWT_SECRET = cfg.get('ui_jwt_secret') or UI_JWT_SECRET
+
+        # 打印提示
+        if created_admin:
+            print_fn('[auth] 已生成默认管理员账号，并启用UI鉴权（请尽快在面板中修改密码）。')
+        if created_secret:
+            print_fn('[auth] 已生成 UI JWT 秘钥。')
+        if enabled_ui and not created_admin and not created_secret:
+            print_fn('[auth] 已确保 UI 鉴权启用。')
+    except Exception as e:
+        print_fn(f'[auth] 启动安全初始化失败: {e}')
+
+
+def _ensure_default_admin_persisted() -> None:
+    """当启用 UI 鉴权时，若未持久化管理员，则写入默认管理员到 auth_config.json。
+
+    默认取环境变量 CLP_UI_USERNAME/CLP_UI_PASSWORD；若未设置，则使用 admin/admin。
+    密码以 PBKDF2 + salt 的方式持久化（不回写明文）。
+    """
+    try:
+        cfg = _load_unified_config()
+        ua = cfg.get('ui_admin') or {}
+        if isinstance(ua, dict) and ua.get('username') and ua.get('password_hash') and ua.get('salt'):
+            return  # 已持久化
+
+        username = os.environ.get('CLP_UI_USERNAME', 'admin')
+        password = os.environ.get('CLP_UI_PASSWORD', 'admin')
+        salt = os.urandom(16)
+        salt_b64 = base64.b64encode(salt).decode('ascii')
+        hash_b64 = _hash_password(password, salt)
+        cfg['ui_admin'] = {'username': username, 'password_hash': hash_b64, 'salt': salt_b64}
+        _save_unified_config(cfg)
+    except Exception:
+        # 避免影响主流程
+        pass
+
+def _get_ui_auth() -> Dict[str, str]:
+    """读取 UI 管理员账号与口令来源。
+
+    优先文件 ~/.clp/ui_auth.json {username, password_hash, salt}；否则回退到环境变量（明文）。
+    返回：{"username": str, "password": str} 或 {"username": str, "password_hash": str, "salt": str}
+    """
+    # 单一文件
+    try:
+        cfg = _load_unified_config()
+        ua = cfg.get('ui_admin')
+        if isinstance(ua, dict) and ua.get('username') and ua.get('password_hash') and ua.get('salt'):
+            return ua
+    except Exception:
+        pass
+    # 环境变量回退（明文）
+    return {
+        'username': os.environ.get('CLP_UI_USERNAME', 'admin'),
+        'password': os.environ.get('CLP_UI_PASSWORD', 'admin'),
+    }
+
+
+def _get_auth_mode() -> int:
+    """读取鉴权模式：0关闭，1全部，2仅UI，3仅codex，4仅claude。
+
+    来源优先级：环境变量 CLP_AUTH_MODE > 文件 ~/.clp/auth_config.json {"mode": N}
+    无配置默认 0。
+    """
+    try:
+        val = os.environ.get('CLP_AUTH_MODE')
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+    try:
+        cfg = Path.home() / '.clp' / 'auth_config.json'
+        if cfg.exists():
+            with open(cfg, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            m = data.get('mode')
+            if isinstance(m, int):
+                return m
+    except Exception:
+        pass
+    return 0
+
+def _is_ui_auth_required() -> bool:
+    mode = _get_auth_mode()
+    # 兼容 list 形式配置
+    try:
+        cfg = _load_unified_config()
+        enabled = cfg.get('enabled')
+        if isinstance(enabled, list):
+            return 'ui' in enabled
+    except Exception:
+        pass
+    return mode in (1, 2)
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode('ascii'))
+
+
+def _jwt_encode(payload: Dict[str, Any], secret: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(',', ':')).encode('utf-8'))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+    signing_input = f"{header_b64}.{payload_b64}".encode('ascii')
+    signature = hmac.new(secret.encode('utf-8'), signing_input, hashlib.sha256).digest()
+    signature_b64 = _b64url_encode(signature)
+    return f"{header_b64}.{payload_b64}.{signature_b64}"
+
+
+def _jwt_decode(token: str, secret: str) -> Dict[str, Any]:
+    parts = token.split('.')
+    if len(parts) != 3:
+        raise ValueError('invalid token')
+    header_b64, payload_b64, sig_b64 = parts
+    signing_input = f"{header_b64}.{payload_b64}".encode('ascii')
+    expected = hmac.new(secret.encode('utf-8'), signing_input, hashlib.sha256).digest()
+    actual = _b64url_decode(sig_b64)
+    if not hmac.compare_digest(expected, actual):
+        raise ValueError('bad signature')
+    payload = json.loads(_b64url_decode(payload_b64))
+    exp = payload.get('exp')
+    if isinstance(exp, (int, float)) and time.time() > float(exp):
+        raise ValueError('token expired')
+    return payload
+
+
+def _verify_ui_auth() -> bool:
+    """校验UI接口 JWT 鉴权。
+
+    - 仅保护 /api/* 路由（除 /api/login）；首页与静态资源不鉴权。
+    - 预检 OPTIONS 放行。
+    - 需要请求头 Authorization: Bearer <jwt>
+    """
+    if not request.path.startswith('/api/'):
+        return True
+    if request.path == '/api/login':
+        return True
+    if request.method == 'OPTIONS':
+        return True
+    if not _is_ui_auth_required():
+        return True
+
+    token = request.cookies.get('ui_jwt')
+    if not token:
+        auth = request.headers.get('Authorization') or request.headers.get('authorization')
+        if not isinstance(auth, str) or not auth.lower().startswith('bearer '):
+            return False
+        token = auth[7:].strip()
+    if not token:
+        return False
+    try:
+        _jwt_decode(token, UI_JWT_SECRET)
+        return True
+    except Exception:
+        return False
+
+
+@app.before_request
+def _api_auth_guard():
+    if not _verify_ui_auth():
+        return jsonify({'error': 'Unauthorized'}), 401
+
+
+@app.route('/login')
+def login_page():
+    login_file = STATIC_DIR / 'login.html'
+    return send_file(login_file)
+
+
+# ---------- Auth Settings APIs ----------
+
+def _read_enabled_services() -> list[str]:
+    # 优先文件 enabled 列表；其次整数 mode；最后空
+    try:
+        cfg = _load_unified_config()
+        enabled = cfg.get('enabled')
+        if isinstance(enabled, list):
+            return [s for s in enabled if s in ('ui', 'codex', 'claude')]
+    except Exception:
+        pass
+    # 环境变量兜底
+    try:
+        enabled_env = os.environ.get('CLP_AUTH_ENABLED')
+        if enabled_env:
+            items = [x.strip() for x in enabled_env.split(',') if x.strip()]
+            return [s for s in items if s in ('ui', 'codex', 'claude')]
+    except Exception:
+        pass
+    mode = _get_auth_mode()
+    if mode == 1:
+        return ['ui', 'codex', 'claude']
+    if mode == 2:
+        return ['ui']
+    if mode == 3:
+        return ['codex']
+    if mode == 4:
+        return ['claude']
+    return []
+
+
+def _write_enabled_services(enabled: list[str]) -> None:
+    data = _load_unified_config()
+    data['enabled'] = [s for s in enabled if s in ('ui', 'codex', 'claude')]
+    _save_unified_config(data)
+
+
+def _read_proxy_auth_flags() -> dict:
+    # 返回是否已配置，用于 UI 展示；不回传明文
+    # 规则：服务标识为“本服务已设置”或“共享已设置”任一即视为已配置
+    res = {
+        'shared': {'has_auth_token': False, 'has_api_key': False},
+        'claude': {'has_auth_token': False, 'has_api_key': False},
+        'codex': {'has_auth_token': False, 'has_api_key': False}
+    }
+    try:
+        cfg = _load_unified_config()
+        proxy = cfg.get('proxy') or {}
+        # 读取分开鉴权标志
+        separate = bool(proxy.get('separate'))
+        shared = proxy.get('shared') or {}
+        if isinstance(shared, dict):
+            if shared.get('auth_token'):
+                res['shared']['has_auth_token'] = True
+            if shared.get('api_key'):
+                res['shared']['has_api_key'] = True
+
+        for svc in ('claude', 'codex'):
+            svc_data = proxy.get(svc) or {}
+            has_token = False
+            has_key = False
+            if isinstance(svc_data, dict):
+                has_token = bool(svc_data.get('auth_token'))
+                has_key = bool(svc_data.get('api_key'))
+            # 不再与共享状态合并：服务仅显示自身配置情况
+            res[svc]['has_auth_token'] = has_token
+            res[svc]['has_api_key'] = has_key
+    except Exception:
+        pass
+    return res
+
+
+def _write_proxy_auth_updates(updates: dict) -> None:
+    # updates: { shared?: {auth_token?, api_key?}, claude?: {...}, codex?: {...} }
+    cfg = _load_unified_config()
+    proxy = cfg.get('proxy') or {}
+
+    def _apply(target_key: str):
+        patch = updates.get(target_key)
+        if not isinstance(patch, dict):
+            return
+        cur = proxy.get(target_key) or {}
+        for key in ('auth_token', 'api_key'):
+            if key in patch:
+                val = patch.get(key)
+                # 允许设置为空串以清空
+                if isinstance(val, str):
+                    cur[key] = val
+        # 透传 disabled 标记（仅影响UI展示）
+        if isinstance(patch, dict) and 'disabled' in patch:
+            cur['disabled'] = bool(patch.get('disabled'))
+        proxy[target_key] = cur
+
+    # 支持 shared 独立字段，不向各服务回填（YAGNI）
+    for key in ('shared', 'claude', 'codex'):
+        _apply(key)
+
+    # 写入分开鉴权模式标志：仅标记，不清空任何密钥
+    if 'separate' in updates:
+        proxy['separate'] = bool(updates.get('separate'))
+        # 同步 disabled 标记，供前端隐藏
+        shared = proxy.setdefault('shared', {})
+        codex = proxy.setdefault('codex', {})
+        claude = proxy.setdefault('claude', {})
+        if proxy['separate']:
+            shared['disabled'] = True
+            codex['disabled'] = False
+            claude['disabled'] = False
+        else:
+            shared['disabled'] = False
+            codex['disabled'] = True
+            claude['disabled'] = True
+
+    cfg['proxy'] = proxy
+    _save_unified_config(cfg)
+
+
+def _get_active_shared_key(cfg: Dict[str, Any]) -> str | None:
+    proxy = cfg.get('proxy') or {}
+    shared = proxy.get('shared') or {}
+    # 新结构优先：keys 数组
+    keys = shared.get('keys')
+    if isinstance(keys, list) and keys:
+        for k in keys:
+            if isinstance(k, dict) and k.get('active') and isinstance(k.get('value'), str):
+                return k.get('value')
+        # fallback to first
+        v = keys[0].get('value') if isinstance(keys[0], dict) else None
+        if isinstance(v, str):
+            return v
+    return None
+
+
+def _get_active_service_key(cfg: Dict[str, Any], service: str) -> str | None:
+    proxy = cfg.get('proxy') or {}
+    bucket = proxy.get(service) or {}
+    keys = bucket.get('keys')
+    if isinstance(keys, list) and keys:
+        for k in keys:
+            if isinstance(k, dict) and k.get('active') and isinstance(k.get('value'), str):
+                return k.get('value')
+        if isinstance(keys[0], dict):
+            v = keys[0].get('value')
+            if isinstance(v, str):
+                return v
+    return None
+
+
+
+
+def _ensure_default_shared_key(cfg: Dict[str, Any], remark: str = '默认') -> bool:
+    """若共享列表为空则生成一个默认密钥（不写入旧镜像字段）。"""
+    proxy = cfg.setdefault('proxy', {})
+    shared = proxy.setdefault('shared', {})
+    keys = shared.get('keys')
+    if isinstance(keys, list) and any(isinstance(k, dict) and k.get('value') for k in keys):
+        return False
+    rnd = base64.urlsafe_b64encode(os.urandom(24)).decode('ascii').rstrip('=')
+    value = f"key_{rnd}"
+    shared['keys'] = [{
+        'id': base64.urlsafe_b64encode(os.urandom(12)).decode('ascii').rstrip('='),
+        'value': value,
+        'remark': remark,
+        'active': True,
+        'created_at': int(time.time())
+    }]
+    cfg['proxy'] = proxy
+    return True
+
+
+def _ensure_default_service_key(cfg: Dict[str, Any], service: str, remark: str = '默认') -> bool:
+    """若服务级列表为空则为指定服务生成一个默认密钥。
+
+    Args:
+        cfg: 已加载的统一配置 dict
+        service: 'claude' 或 'codex'
+        remark: 备注
+    Returns:
+        bool: 是否写入了新密钥
+    """
+    if service not in ('claude', 'codex'):
+        return False
+    proxy = cfg.setdefault('proxy', {})
+    bucket = proxy.setdefault(service, {})
+    keys = bucket.get('keys')
+    if isinstance(keys, list) and any(isinstance(k, dict) and k.get('value') for k in keys):
+        return False
+    if not isinstance(keys, list):
+        keys = []
+        bucket['keys'] = keys
+    kid = base64.urlsafe_b64encode(os.urandom(12)).decode('ascii').rstrip('=')
+    rnd = base64.urlsafe_b64encode(os.urandom(24)).decode('ascii').rstrip('=')
+    value = f"key_{rnd}"
+    keys.append({
+        'id': kid,
+        'value': value,
+        'remark': remark,
+        'active': True,
+        'created_at': int(time.time()),
+    })
+    cfg['proxy'] = proxy
+    return True
+@app.route('/api/auth/settings', methods=['GET'])
+def get_auth_settings():
+    try:
+        enabled = _read_enabled_services()
+        proxy_flags = _read_proxy_auth_flags()
+        # 同时返回分开鉴权模式
+        separate = False
+        try:
+            cfg = _load_unified_config()
+            separate = bool((cfg.get('proxy') or {}).get('separate'))
+        except Exception:
+            pass
+        return jsonify({'enabled': enabled, 'proxy': proxy_flags, 'separate': separate})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/settings', methods=['POST'])
+def save_auth_settings():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        enabled = data.get('enabled')
+        if isinstance(enabled, list):
+            _write_enabled_services(enabled)
+            # 若启用 UI 鉴权，确保默认管理员已持久化
+            if 'ui' in enabled:
+                _ensure_default_admin_persisted()
+        proxy_updates = data.get('proxy')
+        if isinstance(proxy_updates, dict):
+            _write_proxy_auth_updates(proxy_updates)
+        # 自动生成密钥：仅在“共享鉴权”模式下，若共享密钥列表为空则生成一个默认密钥；
+        # 分开鉴权模式下不为各服务自动生成密钥（按需手动创建）。
+        try:
+            cfg = _load_unified_config()
+            separate = bool((cfg.get('proxy') or {}).get('separate'))
+            changed = False
+            if separate:
+                # 分开鉴权：若各服务密钥为空，则为每个服务生成一个默认密钥
+                if _ensure_default_service_key(cfg, 'claude', '默认'): changed = True
+                if _ensure_default_service_key(cfg, 'codex', '默认'): changed = True
+            else:
+                # 共享鉴权：若共享密钥为空则生成一个默认密钥
+                if _ensure_default_shared_key(cfg, '默认'): changed = True
+            if changed:
+                _save_unified_config(cfg)
+        except Exception:
+            pass
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ---- 服务级密钥列表 API（仅在分开鉴权模式下前端展示；后端始终可用） ----
+
+@app.route('/api/auth/service-keys', methods=['GET'])
+def list_service_keys():
+    try:
+        service = request.args.get('service')
+        if service not in ('claude', 'codex'):
+            return jsonify({'error': 'Invalid service'}), 400
+        cfg = _load_unified_config()
+        bucket = (cfg.get('proxy') or {}).get(service) or {}
+        keys = [k for k in (bucket.get('keys') or []) if isinstance(k, dict)]
+        meta = []
+        for k in keys:
+            meta.append({
+                'id': k.get('id'),
+                'remark': k.get('remark'),
+                'value': k.get('value') or '',
+                'created_at': k.get('created_at')
+            })
+        return jsonify({'keys': meta})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/service-key', methods=['GET'])
+def get_service_key_value():
+    try:
+        service = request.args.get('service')
+        if service not in ('claude', 'codex'):
+            return jsonify({'error': 'Invalid service'}), 400
+        key_id = request.args.get('id')
+        cfg = _load_unified_config()
+        bucket = (cfg.get('proxy') or {}).get(service) or {}
+        keys = bucket.get('keys') or []
+        if key_id:
+            for k in keys:
+                if isinstance(k, dict) and k.get('id') == key_id:
+                    return jsonify({'value': k.get('value') or ''})
+            return jsonify({'error': 'Not found'}), 404
+        val = _get_active_service_key(cfg, service)
+        return jsonify({'value': val or ''})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/service-keys', methods=['POST'])
+def add_service_key():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        service = str(data.get('service') or '')
+        remark = str(data.get('remark') or '').strip() or '未命名'
+        if service not in ('claude', 'codex'):
+            return jsonify({'error': 'Invalid service'}), 400
+        cfg = _load_unified_config()
+        proxy = cfg.setdefault('proxy', {})
+        bucket = proxy.setdefault(service, {})
+        keys = bucket.setdefault('keys', [])
+        # 生成
+        kid = base64.urlsafe_b64encode(os.urandom(12)).decode('ascii').rstrip('=')
+        rnd = base64.urlsafe_b64encode(os.urandom(24)).decode('ascii').rstrip('=')
+        value = f"key_{rnd}"
+        active = False if keys else True
+        keys.append({'id': kid, 'value': value, 'remark': remark if keys else '默认', 'active': active, 'created_at': int(time.time())})
+        _save_unified_config(cfg)
+        return jsonify({'id': kid, 'value': value, 'active': active})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+
+
+@app.route('/api/auth/service-keys/<key_id>', methods=['DELETE'])
+def delete_service_key(key_id: str):
+    try:
+        service = request.args.get('service')
+        if service not in ('claude', 'codex'):
+            return jsonify({'error': 'Invalid service'}), 400
+        cfg = _load_unified_config()
+        bucket = (cfg.setdefault('proxy', {})).setdefault(service, {})
+        keys = bucket.setdefault('keys', [])
+        idx = None
+        was_active = False
+        for i, k in enumerate(list(keys)):
+            if isinstance(k, dict) and k.get('id') == key_id:
+                idx = i
+                was_active = bool(k.get('active'))
+                break
+        if idx is None:
+            return jsonify({'error': 'Not found'}), 404
+        keys.pop(idx)
+        if was_active:
+            if keys:
+                keys[0]['active'] = True
+            else:
+                bucket['auth_token'] = ''
+                bucket['api_key'] = ''
+        _save_unified_config(cfg)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/login', methods=['POST'])
+def ui_login():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        username = str(data.get('username') or '')
+        password = str(data.get('password') or '')
+        if not username or not password:
+            return jsonify({'error': 'Missing credentials'}), 400
+
+        # 验证：优先文件（hash），否则环境变量（明文）
+        auth = _get_ui_auth()
+        ok = False
+        if 'password_hash' in auth and 'salt' in auth:
+            ok = (username == auth.get('username') and _verify_password(password, auth.get('salt'), auth.get('password_hash')))
+        else:
+            ok = (username == auth.get('username') and password == auth.get('password'))
+        if not ok:
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        # 24小时有效
+        now = int(time.time())
+        payload = {"sub": username, "iat": now, "exp": now + 24 * 3600}
+        token = _jwt_encode(payload, UI_JWT_SECRET)
+        resp = make_response(jsonify({'token': token}))
+        resp.set_cookie('ui_jwt', token, httponly=True, samesite='Lax')
+        return resp
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/ui-admin', methods=['GET'])
+def get_ui_admin():
+    try:
+        auth = _get_ui_auth()
+        # 不返回密码或 hash，仅返回用户名与是否持久化
+        persisted = 'password_hash' in auth
+        return jsonify({'username': auth.get('username'), 'persisted': persisted})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/ui-admin', methods=['POST'])
+def save_ui_admin():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        username = str(data.get('username') or '')
+        password = str(data.get('password') or '')
+        if not username or not password:
+            return jsonify({'error': '用户名和密码不能为空'}), 400
+
+        # 生成 salt 与 hash
+        salt = os.urandom(16)
+        salt_b64 = base64.b64encode(salt).decode('ascii')
+        hash_b64 = _hash_password(password, salt)
+        cfg = _load_unified_config()
+        cfg['ui_admin'] = {'username': username, 'password_hash': hash_b64, 'salt': salt_b64}
+        _save_unified_config(cfg)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/logout', methods=['POST'])
+def ui_logout():
+    try:
+        resp = make_response(jsonify({'success': True}))
+        resp.delete_cookie('ui_jwt')
+        return resp
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/keys', methods=['GET'])
+def list_shared_keys():
+    try:
+        cfg = _load_unified_config()
+        proxy = cfg.get('proxy') or {}
+        shared = proxy.get('shared') or {}
+        keys = [k for k in (shared.get('keys') or []) if isinstance(k, dict)]
+        meta = []
+        for k in keys:
+            meta.append({
+                'id': k.get('id'),
+                'remark': k.get('remark'),
+                'value': k.get('value') or '',
+                'created_at': k.get('created_at')
+            })
+        return jsonify({'keys': meta})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/key', methods=['GET'])
+def get_shared_key_value():
+    try:
+        key_id = request.args.get('id')
+        cfg = _load_unified_config()
+        shared = (cfg.get('proxy') or {}).get('shared') or {}
+        keys = shared.get('keys') or []
+        if key_id:
+            for k in keys:
+                if isinstance(k, dict) and k.get('id') == key_id:
+                    return jsonify({'value': k.get('value') or ''})
+            return jsonify({'error': 'Not found'}), 404
+        # 无 id 返回 active
+        val = _get_active_shared_key(cfg)
+        return jsonify({'value': val or ''})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/keys', methods=['POST'])
+def add_shared_key():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        remark = str(data.get('remark') or '').strip() or '未命名'
+        cfg = _load_unified_config()
+        proxy = cfg.setdefault('proxy', {})
+        shared = proxy.setdefault('shared', {})
+        keys = shared.setdefault('keys', [])
+        # 生成
+        kid = base64.urlsafe_b64encode(os.urandom(12)).decode('ascii').rstrip('=')
+        rnd = base64.urlsafe_b64encode(os.urandom(24)).decode('ascii').rstrip('=')
+        value = f"key_{rnd}"
+        active = False if keys else True
+        keys.append({'id': kid, 'value': value, 'remark': remark if keys else '默认', 'active': active, 'created_at': int(time.time())})
+        _save_unified_config(cfg)
+        return jsonify({'id': kid, 'value': value, 'active': active})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth/keys/<key_id>', methods=['DELETE'])
+def delete_shared_key(key_id: str):
+    try:
+        cfg = _load_unified_config()
+        shared = (cfg.setdefault('proxy', {})).setdefault('shared', {})
+        keys = shared.setdefault('keys', [])
+        idx = None
+        was_active = False
+        for i, k in enumerate(list(keys)):
+            if isinstance(k, dict) and k.get('id') == key_id:
+                idx = i
+                was_active = bool(k.get('active'))
+                break
+        if idx is None:
+            return jsonify({'error': 'Not found'}), 404
+        keys.pop(idx)
+        # 若删除了 active，则将第一个设为 active
+        if was_active and keys:
+            keys[0]['active'] = True
+        _save_unified_config(cfg)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def _safe_json_load(line: str) -> Dict[str, Any]:

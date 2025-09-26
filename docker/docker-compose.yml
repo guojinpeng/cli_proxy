@@ -1,0 +1,22 @@
+services:
+  clp:
+    image: docker.cnb.cool/likesrt/ccs/clp:latest
+    container_name: clp
+    init: true
+    ports:
+      - "3210:3210"   # Claude proxy
+      - "3211:3211"   # Codex proxy
+      - "3300:3300"   # Web UI (可选)
+    environment:
+      # 是否启动 UI（可在此编辑开关），true/false
+      ENABLE_UI: "false"
+    volumes:
+      - ./clp_data/.clp:/root/.clp
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /root/.clp/run/claude_proxy.pid ] && [ -f /root/.clp/run/codex_proxy.pid ]"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 10s
+    restart: unless-stopped

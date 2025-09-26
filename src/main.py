@@ -4,6 +4,11 @@ import time
 from src.codex import ctl as codex
 from src.claude import ctl as claude
 from src.ui import ctl as ui
+import os
+import base64
+import json
+from pathlib import Path
+import hashlib
 
 def print_status():
     """显示所有服务的运行状态"""
@@ -126,6 +131,19 @@ def main():
         help='显示服务状态',
         description='显示所有代理服务的运行状态、PID和激活配置信息'
     )
+
+    # reset-admin 命令
+    reset_admin = subparsers.add_parser(
+        'reset-admin',
+        help='重置UI管理员账号与密码',
+        description='将 UI 管理员账号密码重置为指定值（写入 ~/.clp/auth_config.json）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  clp reset-admin --username admin --password newpass
+        """
+    )
+    reset_admin.add_argument('--username', required=True, help='新的管理员用户名')
+    reset_admin.add_argument('--password', required=True, help='新的管理员密码')
     
     # ui 命令
     ui_parser = subparsers.add_parser(
@@ -173,6 +191,36 @@ def main():
     elif args.command == 'ui':
         import webbrowser
         webbrowser.open("http://localhost:3300")
+    elif args.command == 'reset-admin':
+        username = args.username
+        password = args.password
+        # 生成salt与hash（与UI保持一致：PBKDF2-HMAC-SHA256，120000轮）
+        salt = os.urandom(16)
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 120000)
+        salt_b64 = base64.b64encode(salt).decode('ascii')
+        hash_b64 = base64.b64encode(dk).decode('ascii')
+
+        auth_path = Path.home() / '.clp' / 'auth_config.json'
+        data = {}
+        if auth_path.exists():
+            try:
+                data = json.loads(auth_path.read_text(encoding='utf-8') or '{}')
+            except Exception:
+                data = {}
+        data.setdefault('enabled', [])
+        if isinstance(data['enabled'], list) and 'ui' not in data['enabled']:
+            data['enabled'].append('ui')
+        elif not isinstance(data['enabled'], list):
+            data['enabled'] = ['ui']
+
+        data['ui_admin'] = {
+            'username': username,
+            'password_hash': hash_b64,
+            'salt': salt_b64,
+        }
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        auth_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        print('已重置管理员账号密码，并确保已启用UI鉴权。')
     else:
         parser.print_help()
 

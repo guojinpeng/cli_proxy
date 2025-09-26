@@ -16,8 +16,14 @@
                 <h1>CLI Proxy 状态监控</h1>
                 <div class="refresh-info">
                     <span>{{ lastUpdate }}</span>
-                    <el-button type="primary" @click="refreshData" :loading="loading" size="small">
+                    <el-button type="primary" @click="refreshData" :loading="loading" size="small" style="margin-left:8px">
                         刷新
+                    </el-button>
+                    <el-button @click="openAuthSettings" size="small" style="margin-left:8px">
+                        鉴权设置
+                    </el-button>
+                    <el-button type="danger" @click="logout" size="small" style="margin-left:8px">
+                        退出登录
                     </el-button>
                 </div>
             </header>
@@ -195,6 +201,7 @@
                                             :type="getStatusTagType(log.status_code)"
                                             size="small">
                                             {{ log.status_code || '-' }}
+                                            
                                         </el-tag>
                                     </span>
                                     <span>{{ log.duration_ms ? `${log.duration_ms}ms` : '-' }}</span>
@@ -216,6 +223,137 @@
                 </section>
             </main>
         </div>
+
+        <!-- 鉴权设置抽屉 -->
+        <el-drawer v-model="authSettingsVisible" title="鉴权与代理凭证设置" size="40%">
+            <div style="padding:8px 0;">
+                <h3>启用鉴权</h3>
+                <el-checkbox v-model="authEnabled.ui">UI 面板</el-checkbox>
+                <el-checkbox v-model="authEnabled.codex">Codex 代理</el-checkbox>
+                <el-checkbox v-model="authEnabled.claude">Claude 代理</el-checkbox>
+                <div style="margin-top:8px">
+                    <el-switch v-model="separateAuth" active-text="分开鉴权（为各服务单独配置密钥）" inactive-text="使用共享密钥"></el-switch>
+                    <div class="mode-tip" style="margin-top:6px;color:#909399;font-size:12px;">
+                        {{ separateAuth ? '当前使用分开鉴权模式，将会禁止共享密钥请求（仅服务级密钥有效）' : '当前使用共享模式，将会禁止服务级密钥请求（仅共享密钥有效）' }}
+                    </div>
+                </div>
+            </div>
+            <el-divider></el-divider>
+            <div>
+                <div v-show="!separateAuth" style="margin-top:12px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h4 style="margin:0;">共享密钥</h4>
+                        <el-button size="small" type="primary" @click="()=>{ pendingAddService=null; addKeyDialogVisible = true }">新增密钥</el-button>
+                    </div>
+                    <div class="key-list" v-if="sharedKeys && sharedKeys.length">
+                        <div class="key-header">
+                            <span>备注</span>
+                            <span>密钥</span>
+                            <span>创建时间</span>
+                            <span>操作</span>
+                        </div>
+                        <div class="key-entries">
+                            <div class="key-entry" v-for="row in sharedKeys" :key="row.id">
+                                <span class="key-col-remark">{{ row.remark || '-' }}</span>
+                                <span class="key-col-value">{{ maskKey(row.value) }}</span>
+                                <span class="key-col-time">{{ new Date((row.created_at||0)*1000).toLocaleString() }}</span>
+                                <span class="key-col-actions">
+                                    <el-button size="small" @click="copySharedKeyValue(row.id)">复制密钥</el-button>
+                                    <el-button size="small" type="danger" :loading="deletingKeyId===row.id" @click="deleteSharedKey(row.id)">删除密钥</el-button>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-else style="color:#909399;font-size:12px;">暂无密钥</div>
+                </div>
+                <el-dialog v-model="addKeyDialogVisible" title="新增密钥" width="400px">
+                    <el-form :model="{remark: newKeyRemark}" label-width="80px">
+                        <el-form-item label="备注">
+                            <el-input v-model="newKeyRemark" placeholder="请输入密钥备注，例如：项目A"></el-input>
+                        </el-form-item>
+                    </el-form>
+                    <template #footer>
+                        <span class="dialog-footer">
+                            <el-button @click="addKeyDialogVisible=false">取消</el-button>
+                            <el-button type="primary" :loading="addingKeyLoading" @click="confirmAddKey">创建</el-button>
+                        </span>
+                    </template>
+                </el-dialog>
+
+                <!-- 分开鉴权下的服务级密钥列表 -->
+                <div v-show="separateAuth" style="margin-top:16px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h4 style="margin:0;">Claude 密钥</h4>
+                        <el-button size="small" type="primary" @click="openAddServiceKey('claude')">新增密钥</el-button>
+                    </div>
+                    <div class="key-list" v-if="serviceKeys.claude && serviceKeys.claude.length">
+                        <div class="key-header">
+                            <span>备注</span>
+                            <span>密钥</span>
+                            <span>创建时间</span>
+                            <span>操作</span>
+                        </div>
+                        <div class="key-entries">
+                            <div class="key-entry" v-for="row in serviceKeys.claude" :key="row.id">
+                                <span class="key-col-remark">{{ row.remark || '-' }}</span>
+                                <span class="key-col-value">{{ maskKey(row.value) }}</span>
+                                <span class="key-col-time">{{ new Date((row.created_at||0)*1000).toLocaleString() }}</span>
+                                <span class="key-col-actions">
+                                    <el-button size="small" @click="copyServiceKey('claude', row.id)">复制密钥</el-button>
+                                    <el-button size="small" type="danger" :loading="deletingKeyId==='claude:'+row.id" @click="deleteServiceKey('claude', row.id)">删除密钥</el-button>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-else style="color:#909399;font-size:12px;">暂无密钥</div>
+                </div>
+
+                <div v-show="separateAuth" style="margin-top:16px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <h4 style="margin:0;">Codex 密钥</h4>
+                        <el-button size="small" type="primary" @click="openAddServiceKey('codex')">新增密钥</el按钮>
+                    </div>
+                    <div class="key-list" v-if="serviceKeys.codex && serviceKeys.codex.length">
+                        <div class="key-header">
+                            <span>备注</span>
+                            <span>密钥</span>
+                            <span>创建时间</span>
+                            <span>操作</span>
+                        </div>
+                        <div class="key-entries">
+                            <div class="key-entry" v-for="row in serviceKeys.codex" :key="row.id">
+                                <span class="key-col-remark">{{ row.remark || '-' }}</span>
+                                <span class="key-col-value">{{ maskKey(row.value) }}</span>
+                                <span class="key-col-time">{{ new Date((row.created_at||0)*1000).toLocaleString() }}</span>
+                                <span class="key-col-actions">
+                                    <el-button size="small" @click="copyServiceKey('codex', row.id)">复制密钥</el-button>
+                                    <el-button size="small" type="danger" :loading="deletingKeyId==='codex:'+row.id" @click="deleteServiceKey('codex', row.id)">删除密钥</el-button>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-else style="color:#909399;font-size:12px;">暂无密钥</div>
+                </div>
+            </div>
+            <el-divider></el-divider>
+            <div>
+                <h3>管理员账号</h3>
+                <el-form label-width="120px">
+                    <el-form-item label="用户名">
+                        <el-input v-model="uiAdmin.username" placeholder="新的管理员用户名"></el-input>
+                    </el-form-item>
+                    <el-form-item label="密码">
+                        <el-input v-model="uiAdmin.password" type="password" show-password placeholder="新的管理员密码（修改后需重新登录）"></el-input>
+                    </el-form-item>
+                </el-form>
+            </div>
+            <template #footer>
+                <div style="flex: auto">
+                    <el-button @click="closeAuthSettings">取消</el-button>
+                    <el-button type="primary" @click="saveAuthSettings">保存</el-button>
+                </div>
+            </template>
+        </el-drawer>
 
         <!-- 配置编辑抽屉 -->
         <el-drawer 
