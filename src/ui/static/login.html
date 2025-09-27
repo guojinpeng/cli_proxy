@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>登录 - CLI Proxy 面板</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus@2.8.0/dist/index.css">
+  <style>
+    .login-container { max-width: 960px; margin: 0 auto; padding: 24px; }
+    .login-card { background: #fff; border: 1px solid #ebeef5; border-radius: 10px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    .login-header { display:flex; align-items:center; justify-content:space-between; margin-bottom: 16px; }
+    .login-title { font-size: 18px; color:#2c3e50; font-weight:600; }
+    .login-sub { font-size: 12px; color:#909399; }
+  </style>
+</head>
+<body>
+  <div id="app" class="login-container">
+    <header class="header">
+      <h1>CLI Proxy 状态监控</h1>
+    </header>
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-title">登录</div>
+        <div class="login-sub">使用管理员账号进入面板</div>
+      </div>
+      <el-form ref="formRef" :model="form" label-width="80px" @submit.prevent="doLogin" @keydown.enter="doLogin">
+        <el-form-item label="用户名">
+          <el-input v-model="form.username" autocomplete="username" placeholder="请输入用户名"></el-input>
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="form.password" type="password" show-password autocomplete="current-password" placeholder="请输入密码"></el-input>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="loading" @click="doLogin">登录</el-button>
+          <el-button @click="reset">重置</el-button>
+        </el-form-item>
+      </el-form>
+      <div class="footer" style="color:#909399;font-size:12px">认证成功后将跳转至面板首页</div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/vue@3.5.12/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/element-plus@2.8.0/dist/index.full.min.js"></script>
+  <script>
+    const { createApp, reactive, ref } = Vue;
+    const app = createApp({
+      setup() {
+        const form = reactive({ username: '', password: '' });
+        const loading = ref(false);
+        const doLogin = async () => {
+          if (!form.username || !form.password) {
+            ElementPlus.ElMessage.warning('请输入用户名和密码');
+            return;
+          }
+          loading.value = true;
+          try {
+            const resp = await fetch('/api/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: form.username, password: form.password })
+            });
+            if (!resp.ok) {
+              throw new Error('登录失败');
+            }
+            ElementPlus.ElMessage.success('登录成功');
+            setTimeout(() => { window.location.href = '/'; }, 400);
+          } catch (e) {
+            ElementPlus.ElMessage.error(e.message || '登录失败');
+          } finally {
+            loading.value = false;
+          }
+        };
+        const reset = () => { form.username = ''; form.password = ''; };
+        return { form, loading, doLogin, reset };
+      }
+    });
+    app.use(ElementPlus);
+    app.mount('#app');
+  </script>
+</body>
+</html>

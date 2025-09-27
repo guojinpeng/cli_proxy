@@ -221,6 +221,31 @@ header h1 {
     overflow: hidden;
 }
 
+/* Element Plus 表格可视与换行修正 */
+.el-table__inner-wrapper { overflow: visible !important; }
+.el-table .cell { white-space: normal !important; word-break: break-all !important; }
+
+/* Key table pretty layout */
+.key-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 8px; background: #fafafa; border-radius: 6px; border: 1px solid #f0f0f0; }
+.key-row + .key-row { margin-top: 8px; }
+.key-main { display: flex; flex-direction: column; gap: 6px; }
+.key-remark { font-size: 14px; font-weight: 600; color: #303133; }
+.key-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; background: #f0f2f5; color: #606266; padding: 3px 8px; border-radius: 4px; display: inline-block; }
+.key-time { color: #909399; font-size: 12px; }
+.key-actions .el-button + .el-button { margin-left: 8px; }
+
+/* Grid-style key list similar to logs */
+.key-list { background: white; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+.key-header { display: grid; grid-template-columns: 2fr 2fr 2fr 1fr; gap: 12px; padding: 10px 12px; background: #ecf0f1; font-weight: 600; color: #2c3e50; border-bottom: 1px solid #e5e7eb; }
+.key-entries { padding: 6px 0; }
+.key-entry { display: grid; grid-template-columns: 2fr 2fr 2fr 1fr; gap: 12px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #f2f3f5; }
+.key-entry:last-child { border-bottom: none; }
+.key-col-remark { font-weight: 600; color: #303133; }
+.key-col-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; background: #f6f7f9; color: #606266; padding: 4px 8px; border-radius: 4px; display: inline-block; }
+.key-col-time { color: #909399; font-size: 12px; }
+.key-col-actions { text-align: right; }
+.key-col-actions .el-button + .el-button { margin-left: 8px; }
+
 .logs-table {
     min-height: 200px;
 }

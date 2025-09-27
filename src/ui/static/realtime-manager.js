@@ -71,6 +71,7 @@ class RealTimeManager {
             return;
         }
 
+        // 采用 HttpOnly Cookie 的 JWT，握手会自动携带 Cookie
         const wsUrl = `ws://${window.location.hostname}:${port}/ws/realtime`;
         console.log(`正在连接 ${serviceName} WebSocket: ${wsUrl}`);
 
@@ -140,6 +141,14 @@ class RealTimeManager {
                     code: event.code,
                     reason: event.reason
                 });
+
+                // 未鉴权提示与引导
+                if (event.code === 1008) {
+                    try {
+                        window.ElementPlus && window.ElementPlus.ElMessage && window.ElementPlus.ElMessage.warning('需要登录以建立实时连接');
+                        setTimeout(() => { window.location.href = '/login'; }, 300);
+                    } catch (_) {}
+                }
 
                 // 非正常关闭时自动重连
                 if (!this.isDestroyed && event.code !== 1000) {

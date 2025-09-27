@@ -72,12 +72,29 @@ src/
     ├── platform_helper.py     # 平台工具
     └── usage_parser.py        # 使用统计解析器
 ```
-## 快速开始
+## 快速开始（本地开发）
 
-### 安装
+### 安装与启动
 ```bash
-pip install --user --force-reinstall ./dist/clp-1.8.0-py3-none-any.whl
+# 准备虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 安装项目（开发模式）
+pip install -e .
+
+# 启动本地服务（claude:3210 / codex:3211 / ui:3300）
+clp start
+clp status
 ```
+
+首次启动会自动完成鉴权安全初始化：
+
+- 若未配置管理员，写入默认管理员（用户名/密码优先取环境变量 `CLP_UI_USERNAME`/`CLP_UI_PASSWORD`，否则 `admin/admin`）；
+- 若未设置 UI JWT 秘钥，自动生成随机 `ui_jwt_secret`；
+- 默认启用 UI 鉴权（将 `ui` 写入 `enabled`）。
+
+访问 UI 登录页：`http://localhost:3300/login`
 
 ## 命令使用方法
 
@@ -168,14 +185,43 @@ wire_api = "responses"
 pip install -e .
 ```
 
-### 2. 配置文件
+### 2. 配置文件（含鉴权）
 
 工具会在用户主目录下创建 `~/.clp/` 目录存储配置：
 
-- `~/.clp/claude.json` - Claude服务配置
-- `~/.clp/codex.json` - Codex服务配置
+- `~/.clp/auth_config.json` - 鉴权统一配置（仅此文件生效）
+  - `enabled`: 启用的鉴权目标（任意组合，如 `ui`、`codex`、`claude`）
+  - `ui_jwt_secret`: UI/WS 共用的 JWT 签名秘钥（优先从此读取，其次 `CLP_UI_JWT_SECRET`）
+  - `ui_admin`: 管理员账号（PBKDF2-HMAC-SHA256 + salt）
+  - `proxy`: 代理入站凭证（`shared` 为共享回退；`claude`/`codex` 为各自覆盖）
+- `~/.clp/claude.json` - Claude 服务配置
+- `~/.clp/codex.json` - Codex 服务配置
 - `~/.clp/run/` - 运行时文件（PID、日志）
 - `~/.clp/data/` - 数据文件（请求日志、统计数据）
+
+> 代理入站鉴权：`Authorization: Bearer <token>` 或 `X-API-Key: <key>` 二选一即可；WebSocket 统一使用 UI 的 JWT（Cookie/Header/Query）。
+
+### 3. 常用 CLI 命令
+
+```bash
+clp start|stop|restart|status|ui
+clp reset-admin --username <name> --password <pass>   # 重置管理员并确保启用 UI 鉴权
+```
+
+### 4. 开发测试（鉴权功能）
+
+提供本地测试脚本：`tmp/test_auth.py`（不纳入版本控制）
+
+```bash
+source .venv/bin/activate
+python tmp/test_auth.py
+```
+
+验证点：
+
+- UI 登录 200；
+- 启用 `codex` 鉴权后，无凭证访问返回 401；
+- 仅设置 api_key 时，`X-API-Key` 与 `Authorization: Bearer`（同值）均可通过；
 
 ### 添加新的AI服务
 

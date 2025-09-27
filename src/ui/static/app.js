@@ -1,5 +1,5 @@
 // Vue 3 + Element Plus CLI Proxy Monitor Application
-const { createApp, ref, reactive, onMounted, nextTick, watch } = Vue;
+const { createApp, ref, reactive, onMounted, nextTick, watch, computed } = Vue;
 const { ElMessage, ElMessageBox } = ElementPlus;
 
 const app = createApp({
@@ -181,6 +181,273 @@ const app = createApp({
             output: '输出',
             reasoning: '思考',
             total: '总计'
+        };
+
+        // 鉴权设置面板
+        const authSettingsVisible = ref(false);
+        const authEnabled = reactive({ ui: false, codex: false, claude: false });
+        const separateAuth = ref(false);
+        const sharedKey = ref('');
+        const showSharedKey = ref(false);
+        const sharedKeys = ref([]);
+        const serviceKeys = reactive({ claude: [], codex: [] });
+        const deletingKeyId = ref(null);
+        const addingKeyLoading = ref(false);
+        const addKeyDialogVisible = ref(false);
+        const newKeyRemark = ref('');
+        const proxyCreds = reactive({
+            claude: { auth_token: null, api_key: null },
+            codex:  { auth_token: null, api_key: null }
+        });
+        const proxyFlags = reactive({
+            shared: { has_auth_token: false, has_api_key: false },
+            claude: { has_auth_token: false, has_api_key: false },
+            codex:  { has_auth_token: false, has_api_key: false }
+        });
+        const uiAdmin = reactive({ username: '', password: '' });
+        const sharedCreds = reactive({ auth_token: null, api_key: null });
+        const showField = reactive({
+            shared: { auth_token: false, api_key: false },
+            claude: { auth_token: false, api_key: false },
+            codex:  { auth_token: false, api_key: false }
+        });
+
+        const hasAuthEnabled = computed(() => authEnabled.ui || authEnabled.codex || authEnabled.claude);
+
+        const openAuthSettings = async () => {
+            authSettingsVisible.value = true;
+            await loadAuthSettings();
+        };
+
+        const closeAuthSettings = () => {
+            authSettingsVisible.value = false;
+        };
+
+        const loadAuthSettings = async () => {
+            try {
+                const data = await fetchWithErrorHandling('/api/auth/settings');
+                const enabled = Array.isArray(data.enabled) ? data.enabled : [];
+                authEnabled.ui = enabled.includes('ui');
+                authEnabled.codex = enabled.includes('codex');
+                authEnabled.claude = enabled.includes('claude');
+                separateAuth.value = !!data.separate;
+                if (data.proxy) {
+                    proxyFlags.shared.has_auth_token = !!data.proxy?.shared?.has_auth_token;
+                    proxyFlags.shared.has_api_key    = !!data.proxy?.shared?.has_api_key;
+                    proxyFlags.claude.has_auth_token = !!data.proxy?.claude?.has_auth_token;
+                    proxyFlags.claude.has_api_key    = !!data.proxy?.claude?.has_api_key;
+                    proxyFlags.codex.has_auth_token  = !!data.proxy?.codex?.has_auth_token;
+                    proxyFlags.codex.has_api_key     = !!data.proxy?.codex?.has_api_key;
+                }
+                // 刷新共享密钥（若已配置）
+                try {
+                    const res = await fetchWithErrorHandling('/api/auth/key');
+                    sharedKey.value = res?.value || '';
+                } catch (_) {}
+                await loadSharedKeys();
+                await loadServiceKeys('claude');
+                await loadServiceKeys('codex');
+                // 拉取 UI 管理员信息
+                try {
+                    const admin = await fetchWithErrorHandling('/api/auth/ui-admin');
+                    uiAdmin.username = admin.username || '';
+                    uiAdmin.password = '';
+                } catch (_) {}
+            } catch (e) {
+                ElMessage.error('加载鉴权设置失败: ' + e.message);
+            }
+        };
+
+        const saveAuthSettings = async () => {
+            try {
+                const enabled = [];
+                if (authEnabled.ui) enabled.push('ui');
+                if (authEnabled.codex) enabled.push('codex');
+                if (authEnabled.claude) enabled.push('claude');
+
+                const body = { enabled, proxy: { separate: !!separateAuth.value } };
+
+                const resp = await fetchWithErrorHandling('/api/auth/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (uiAdmin.username && uiAdmin.password) {
+                    try {
+                        await fetchWithErrorHandling('/api/auth/ui-admin', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: uiAdmin.username, password: uiAdmin.password })
+                        });
+                    } catch (_) {}
+                }
+                if (!resp.success) throw new Error(resp.error || '保存失败');
+                ElMessage.success('鉴权设置已保存');
+                await loadAuthSettings();
+            } catch (e) {
+                ElMessage.error('保存鉴权设置失败: ' + (e.message || e));
+            }
+        };
+
+        const copySharedKeyValue = async (id) => {
+            try {
+                const r = await fetchWithErrorHandling('/api/auth/key?id=' + encodeURIComponent(id));
+                const v = r?.value || '';
+                if (v) { await navigator.clipboard.writeText(v); ElMessage.success('已复制'); }
+                else { ElMessage.info('未设置'); }
+            } catch (e) { ElMessage.error('复制失败: ' + e.message); }
+        };
+
+        const loadSharedKeys = async () => {
+            try {
+                const res = await fetchWithErrorHandling('/api/auth/keys');
+                sharedKeys.value = Array.isArray(res.keys) ? res.keys : [];
+            } catch (e) {
+                sharedKeys.value = [];
+            }
+        };
+
+        const maskKey = (v) => {
+            if (!v || typeof v !== 'string') return '';
+            if (v.length <= 6) return v[0] + '****';
+            return v.slice(0, 3) + '****' + v.slice(-2);
+        };
+
+        const loadServiceKeys = async (service) => {
+            try {
+                const res = await fetchWithErrorHandling(`/api/auth/service-keys?service=${service}`);
+                serviceKeys[service] = Array.isArray(res.keys) ? res.keys : [];
+            } catch (e) {
+                serviceKeys[service] = [];
+            }
+        };
+
+        const addSharedKey = async () => {
+            if (!newKeyRemark.value.trim()) {
+                ElMessage.warning('请输入密钥备注');
+                return;
+            }
+            try {
+                addingKeyLoading.value = true;
+                const res = await fetchWithErrorHandling('/api/auth/keys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ remark: newKeyRemark.value.trim() })
+                });
+                addKeyDialogVisible.value = false;
+                newKeyRemark.value = '';
+                await loadAuthSettings();
+                // 提示复制
+                if (res?.value) {
+                    await navigator.clipboard.writeText(res.value);
+                    ElMessage.success('已创建并复制新密钥');
+                } else {
+                    ElMessage.success('密钥已创建');
+                }
+            } catch (e) {
+                ElMessage.error('创建密钥失败: ' + (e.message || e));
+            } finally { addingKeyLoading.value = false; }
+        };
+
+        const pendingAddService = ref(null);
+
+        const confirmAddKey = async () => {
+            if (pendingAddService.value) {
+                await addServiceKey(pendingAddService.value, newKeyRemark.value.trim());
+                addKeyDialogVisible.value = false;
+                newKeyRemark.value = '';
+                pendingAddService.value = null;
+                return;
+            }
+            await addSharedKey();
+        };
+
+        const openAddServiceKey = (service) => {
+            pendingAddService.value = service;
+            addKeyDialogVisible.value = true;
+        };
+
+        const addServiceKey = async (service, remark) => {
+            if (!remark) {
+                ElMessage.warning('请输入密钥备注');
+                return;
+            }
+            try {
+                addingKeyLoading.value = true;
+                const res = await fetchWithErrorHandling('/api/auth/service-keys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ service, remark })
+                });
+                await loadServiceKeys(service);
+                if (res?.value) {
+                    await navigator.clipboard.writeText(res.value);
+                    ElMessage.success('已创建并复制新密钥');
+                } else {
+                    ElMessage.success('密钥已创建');
+                }
+            } catch (e) {
+                ElMessage.error('创建密钥失败: ' + (e.message || e));
+            } finally { addingKeyLoading.value = false; }
+        };
+
+        const deleteServiceKey = async (service, id) => {
+            try {
+                deletingKeyId.value = `${service}:${id}`;
+                await fetchWithErrorHandling(`/api/auth/service-keys/${id}?service=${service}`, { method: 'DELETE' });
+                await loadServiceKeys(service);
+                ElMessage.success('密钥已删除');
+            } catch (e) {
+                ElMessage.error('删除失败: ' + (e.message || e));
+            } finally { deletingKeyId.value = null; }
+        };
+
+        const copyServiceKey = async (service, id) => {
+            try {
+                const r = await fetchWithErrorHandling(`/api/auth/service-key?service=${service}&id=${encodeURIComponent(id)}`);
+                const v = r?.value || '';
+                if (v) {
+                    await navigator.clipboard.writeText(v);
+                    ElMessage.success('已复制');
+                } else {
+                    ElMessage.info('未设置');
+                }
+            } catch (e) {
+                ElMessage.error('复制失败: ' + (e.message || e));
+            }
+        };
+
+
+        const deleteSharedKey = async (id) => {
+            try {
+                deletingKeyId.value = id;
+                await fetchWithErrorHandling(`/api/auth/keys/${id}`, { method: 'DELETE' });
+                await loadAuthSettings();
+                ElMessage.success('密钥已删除');
+            } catch (e) {
+                ElMessage.error('删除失败: ' + (e.message || e));
+            } finally { deletingKeyId.value = null; }
+        };
+
+        const saveUiAdmin = async () => {
+            try {
+                if (!uiAdmin.username || !uiAdmin.password) {
+                    ElMessage.warning('请输入新的用户名与密码');
+                    return;
+                }
+                const resp = await fetchWithErrorHandling('/api/auth/ui-admin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: uiAdmin.username, password: uiAdmin.password })
+                });
+                if (!resp.success) throw new Error(resp.error || '保存失败');
+                ElMessage.success('管理员信息已更新，请重新登录');
+                // 调用后端注销并跳转
+                try { await fetchWithErrorHandling('/api/logout', { method: 'POST' }); } catch (_) {}
+                setTimeout(() => { window.location.href = '/login'; }, 500);
+            } catch (e) {
+                ElMessage.error('保存管理员信息失败: ' + (e.message || e));
+            }
         };
         
         const normalizeUsageBlock = (block) => {
@@ -624,10 +891,20 @@ const app = createApp({
         };
 
         // API 请求方法
-        const fetchWithErrorHandling = async (url, options = {}) => {
+        const fetchWithErrorHandling = async (url, options = {}, _retried=false) => {
             try {
-                const response = await fetch(url, options);
+                // UI 接口附带 JWT（账号密码登录）
+                const opt = { ...options };
+                // 使用 HttpOnly Cookie 进行鉴权，无需在前端附加头
+                if (!opt.headers) opt.headers = {};
+
+                const response = await fetch(url, opt);
                 if (!response.ok) {
+                    // 401 时跳转到登录页（避免对 /api/login 递归）并给出提示
+                    if (response.status === 401 && url !== '/api/login' && !_retried) {
+                        try { ElementPlus.ElMessage && ElementPlus.ElMessage.warning('需要登录，正在跳转登录页'); } catch (e) {}
+                        window.location.href = '/login';
+                    }
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
                 return await response.json();
@@ -635,6 +912,16 @@ const app = createApp({
                 console.error(`API请求失败 ${url}:`, error);
                 throw error;
             }
+        };
+
+        // 统一的登出方法：调用后端注销并跳转登录页
+        const logout = async () => {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                window.location.href = '/login';
+              } catch (error) {
+                console.error('登出失败:', error);
+              }
         };
         
         // 加载状态数据
@@ -1603,8 +1890,41 @@ const app = createApp({
             openUsageDrawer,
             closeUsageDrawer,
             clearUsageData,
+            logout,
             loadUsageDetails,
             getSortedHeaderKeys,
+            // 鉴权设置
+            authSettingsVisible,
+            authEnabled,
+            proxyCreds,
+            openAuthSettings,
+            closeAuthSettings,
+            saveAuthSettings,
+            hasAuthEnabled,
+            sharedCreds,
+            showField,
+            sharedKey,
+            showSharedKey,
+            sharedKeys,
+            addKeyDialogVisible,
+            newKeyRemark,
+            addSharedKey,
+            confirmAddKey,
+            openAddServiceKey,
+            deleteSharedKey,
+            addServiceKey,
+            deleteServiceKey,
+            copyServiceKey,
+            copySharedKeyValue,
+            maskKey,
+            saveUiAdmin,
+            proxyFlags,
+            uiAdmin,
+            separateAuth,
+            serviceKeys,
+            pendingAddService,
+            deletingKeyId,
+            addingKeyLoading,
             startAddingSite,
             confirmAddSite,
             cancelAddSite,
