@@ -206,7 +206,7 @@ if __name__ == '__main__':
     import uvicorn
     import os
 
-    proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
+    proxy_host = os.getenv('CLP_PROXY_HOST', '127.0.0.1')
     uvicorn.run(
         app,
         host=proxy_host,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clp"
-version = "1.9.0"
+version = "1.10.0"
 description = "本地CLI代理工具"
 authors = [
     {name = "gjp"}

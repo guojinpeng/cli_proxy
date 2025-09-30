@@ -794,7 +794,7 @@ class BaseProxyService(ABC):
         env = os.environ.copy()
 
         # 通过环境变量控制代理服务监听地址
-        proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
+        proxy_host = os.getenv('CLP_PROXY_HOST', '127.0.0.1')
 
         try:
             with open(self.log_file, 'a') as log_file:
@@ -891,7 +891,7 @@ class BaseServiceController(ABC):
         env = os.environ.copy()
 
         # 通过环境变量控制代理服务监听地址
-        proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
+        proxy_host = os.getenv('CLP_PROXY_HOST', '127.0.0.1')
 
         uvicorn_cmd = [
             sys.executable, '-m', 'uvicorn',

@@ -10,7 +10,7 @@ from ..utils.platform_helper import is_process_running, kill_process, create_det
 
 # UI服务配置
 DEFAULT_PORT = 3300
-DEFAULT_HOST = os.getenv('CLP_UI_HOST', '0.0.0.0')  # 通过环境变量控制监听地址
+DEFAULT_HOST = os.getenv('CLP_UI_HOST', '127.0.0.1')  # 通过环境变量控制监听地址
 CONFIG_DIR = Path.home() / '.clp/run'
 PID_FILE = CONFIG_DIR / 'ui.pid'
 LOG_FILE = CONFIG_DIR / 'ui.log'
