@@ -74,41 +74,75 @@ CLP (CLI Proxy) 是一个本地AI代理工具，用于管理和转发 Claude 和
 
 项目支持通过环境变量控制服务监听地址：
 
-- `CLP_UI_HOST` - UI 服务监听地址（默认 `0.0.0.0`）
-- `CLP_PROXY_HOST` - Claude/Codex 代理服务监听地址（默认 `0.0.0.0`）
+- `CLP_UI_HOST` - UI 服务监听地址（默认 `127.0.0.1`）
+- `CLP_PROXY_HOST` - Claude/Codex 代理服务监听地址（默认 `127.0.0.1`）
 
 **使用示例**：
 
 ```bash
-# 本地开发环境 - 允许所有网络接口访问
+# 默认配置（仅本地访问，适合公网部署）
 clp start
 
-# 公网服务器部署 - 仅本地访问（安全）
-export CLP_UI_HOST=127.0.0.1
-export CLP_PROXY_HOST=127.0.0.1
+# 本地开发环境 - 允许局域网访问
+export CLP_UI_HOST=0.0.0.0
+export CLP_PROXY_HOST=0.0.0.0
 clp restart
 
 # 或者一次性设置
-CLP_UI_HOST=127.0.0.1 CLP_PROXY_HOST=127.0.0.1 clp start
+CLP_UI_HOST=0.0.0.0 CLP_PROXY_HOST=0.0.0.0 clp start
 
 # 持久化配置（添加到 ~/.bashrc 或 ~/.zshrc）
-echo 'export CLP_UI_HOST=127.0.0.1' >> ~/.bashrc
-echo 'export CLP_PROXY_HOST=127.0.0.1' >> ~/.bashrc
+echo 'export CLP_UI_HOST=0.0.0.0' >> ~/.bashrc
+echo 'export CLP_PROXY_HOST=0.0.0.0' >> ~/.bashrc
 source ~/.bashrc
+```
+
+### 虚拟环境管理
+
+推荐使用虚拟环境隔离依赖：
+
+```bash
+# 创建虚拟环境
+python3 -m venv clp-env
+
+# 激活虚拟环境
+source clp-env/bin/activate
+
+# 在虚拟环境中安装
+pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+
+# 使用 clp 命令
+clp restart
+
+# 退出虚拟环境
+deactivate
 ```
 
 ### 安装
 ```bash
-# 从源代码安装
+# 方式 1：从源代码安装（开发模式）
 pip install -e .
 
-# 从 wheel 包安装
-pip install --user --force-reinstall ./dist/clp-1.9.0-py3-none-any.whl
+# 方式 2：从 wheel 包安装（推荐）
+pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+
+# 方式 3：在虚拟环境中安装（推荐用于生产环境）
+python3 -m venv clp-env
+source clp-env/bin/activate
+pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
 ```
 
-### 构建
+### 构建与打包
+
 ```bash
-# 构建 wheel 包
+# 方式 1：直接构建（需要先安装 build 模块）
+pip install build
+python -m build
+
+# 方式 2：在虚拟环境中构建（推荐）
+python3 -m venv clp-env
+source clp-env/bin/activate
+pip install build
 python -m build
 ```
 

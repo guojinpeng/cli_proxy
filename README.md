@@ -78,10 +78,32 @@ src/
 ```
 ## 快速开始
 
-### 安装
+### 虚拟环境安装（推荐）
+
+使用虚拟环境可以更好地隔离依赖：
+
 ```bash
-pip install --user --force-reinstall ./dist/clp-1.8.0-py3-none-any.whl
-pip install --user --force-reinstall ./dist/clp-1.9.0-py3-none-any.whl
+# 创建虚拟环境
+python3 -m venv clp-env
+
+# 激活虚拟环境
+source clp-env/bin/activate
+
+# 安装 CLP
+pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+
+# 使用 clp 命令
+clp start
+
+# 退出虚拟环境时使用
+deactivate
+```
+
+### 直接安装
+```bash
+# 安装最新版本
+pip install --force-reinstall ./dist/clp-1.10.0-py3-none-any.whl
+
 # 更新后需要重启服务新功能才生效（先杀掉clp占用的三个端口保险一点）
 # macOS / Linux
 lsof -ti:3210,3211,3300 | xargs kill -9
@@ -192,7 +214,9 @@ CLP 支持通过环境变量灵活控制服务的监听地址，适应不同的�
 需要从局域网内其他设备访问：
 
 ```bash
-# 使用默认配置，允许所有网络接口访问
+# 允许所有网络接口访问
+export CLP_UI_HOST=0.0.0.0
+export CLP_PROXY_HOST=0.0.0.0
 clp start
 
 # 从同一局域网的其他设备访问
@@ -201,14 +225,10 @@ clp start
 
 #### 场景 2：公网服务器部署（推荐配置）
 
-服务部署在公网服务器，需要保护内部服务：
+服务部署在公网服务器，使用默认配置（仅本地访问）：
 
 ```bash
-# 设置环境变量，仅允许本地访问
-export CLP_UI_HOST=127.0.0.1
-export CLP_PROXY_HOST=127.0.0.1
-
-# 启动服务
+# 使用默认配置，仅允许本地访问（安全）
 clp start
 
 # 通过 SSH 隧道或 Nginx 反向代理访问
@@ -649,11 +669,12 @@ sudo netstat -tlnp | grep -E '3300|3210|3211'
 
 #### 问题 1：无法从外部访问服务
 
-**原因**：监听地址设置为 `127.0.0.1`
+**原因**：使用默认配置（`127.0.0.1`），仅允许本地访问
 
 **解决**：
 ```bash
 export CLP_UI_HOST=0.0.0.0
+export CLP_PROXY_HOST=0.0.0.0
 clp restart
 ```
 
@@ -682,13 +703,43 @@ cat ~/.clp/run/codex_proxy.log
 
 ## 开发指南
 
-### 1. 安装依赖
+### 1. 虚拟环境设置（推荐）
+
+```bash
+# 创建虚拟环境
+python3 -m venv clp-env
+
+# 激活虚拟环境
+source clp-env/bin/activate
+
+# 安装依赖
+pip install -e .
+
+# 退出虚拟环境
+deactivate
+```
+
+### 2. 直接安装依赖
 
 ```bash
 pip install -e .
 ```
 
-### 2. 配置文件
+### 3. 构建打包
+
+```bash
+# 方式 1：直接构建
+pip install build
+python -m build
+
+# 方式 2：在虚拟环境中构建（推荐）
+python3 -m venv clp-env
+source clp-env/bin/activate
+pip install build
+python -m build
+```
+
+### 4. 配置文件
 
 工具会在用户主目录下创建 `~/.clp/` 目录存储配置：
 
