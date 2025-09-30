@@ -1170,10 +1170,11 @@ def reset_loadbalance_failures():
 
 def start_ui_server(port=3300):
     """启动UI服务器并打开浏览器"""
-    print(f"启动Web UI服务器在端口 {port}")
+    host = os.getenv('CLP_UI_HOST', '0.0.0.0')
+    print(f"启动Web UI服务器在 {host}:{port}")
 
     # 启动Flask应用
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host=host, port=port, debug=False)
 
 if __name__ == '__main__':
     start_ui_server()

@@ -10,6 +10,7 @@ from ..utils.platform_helper import is_process_running, kill_process, create_det
 
 # UI服务配置
 DEFAULT_PORT = 3300
+DEFAULT_HOST = os.getenv('CLP_UI_HOST', '0.0.0.0')  # 通过环境变量控制监听地址
 CONFIG_DIR = Path.home() / '.clp/run'
 PID_FILE = CONFIG_DIR / 'ui.pid'
 LOG_FILE = CONFIG_DIR / 'ui.log'
@@ -49,7 +50,7 @@ def start_daemon(port=DEFAULT_PORT):
             # Windows 使用 waitress
             cmd = [
                 sys.executable, '-m', 'waitress',
-                '--host=0.0.0.0',
+                f'--host={DEFAULT_HOST}',
                 f'--port={port}',
                 '--threads=4',
                 'src.ui.ui_server:app'
@@ -59,7 +60,7 @@ def start_daemon(port=DEFAULT_PORT):
             cmd = [
                 sys.executable, '-m', 'gunicorn',
                 '-w', '2',
-                '-b', f'0.0.0.0:{port}',
+                '-b', f'{DEFAULT_HOST}:{port}',
                 'src.ui.ui_server:app'
             ]
 

@@ -1096,10 +1096,12 @@ def run_app(port=3210):
 if __name__ == '__main__':
     # 调试模式直接运行Uvicorn
     import uvicorn
+    import os
 
+    proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
     uvicorn.run(
         app,
-        host='0.0.0.0',
+        host=proxy_host,
         port=3210,
         log_level='info',
         timeout_keep_alive=60,

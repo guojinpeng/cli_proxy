@@ -117,3 +117,6 @@ temp/
 tmp/
 
 nul
+
+# my custom
+clp-env/

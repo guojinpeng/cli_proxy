@@ -789,16 +789,19 @@ class BaseProxyService(ABC):
         import os
         # 切换到项目根目录
         project_root = Path(__file__).parent.parent.parent
-        
+
         # 在daemon环境中，需要明确指定环境和重定向
         env = os.environ.copy()
-        
+
+        # 通过环境变量控制代理服务监听地址
+        proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
+
         try:
             with open(self.log_file, 'a') as log_file:
                 uvicorn_cmd = [
                     sys.executable, '-m', 'uvicorn',
                     f'src.{self.service_name}.proxy:app',
-                    '--host', '0.0.0.0',
+                    '--host', proxy_host,
                     '--port', str(self.port),
                     '--http', 'h11',
                     '--timeout-keep-alive', '60',
@@ -886,11 +889,14 @@ class BaseServiceController(ABC):
         import os
         project_root = Path(__file__).parent.parent.parent
         env = os.environ.copy()
-        
+
+        # 通过环境变量控制代理服务监听地址
+        proxy_host = os.getenv('CLP_PROXY_HOST', '0.0.0.0')
+
         uvicorn_cmd = [
             sys.executable, '-m', 'uvicorn',
             f'{self.proxy_module_path}:app',
-            '--host', '0.0.0.0',
+            '--host', proxy_host,
             '--port', str(self.port),
             '--http', 'h11',
             '--timeout-keep-alive', '60',
