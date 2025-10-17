@@ -1860,6 +1860,27 @@ header h1 {
     align-items: center;
 }
 
+.lb-settings-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.lb-settings-label {
+    font-weight: 500;
+    color: #606266;
+}
+
+.lb-settings-row .el-input-number {
+    width: 120px;
+}
+
+.lb-settings-hint {
+    font-size: 12px;
+    color: #909399;
+}
+
 .lb-weight-list {
     list-style: none;
     padding: 0;
@@ -1913,11 +1934,18 @@ header h1 {
 
 .lb-actions {
     display: flex;
+    align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .lb-actions .el-button {
     padding: 0 12px;
+}
+
+.lb-disable-checkbox {
+    font-size: 12px;
+    color: #606266;
 }
 
 .loadbalance-hint {

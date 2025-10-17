@@ -1029,8 +1029,11 @@ def get_loadbalance_config():
         def default_section():
             return {
                 'failureThreshold': 3,
+                'autoResetMinutes': 10,
                 'currentFailures': {},
-                'excludedConfigs': []
+                'excludedConfigs': [],
+                'excludedTimestamps': {},
+                'manualDisabledUntil': {}
             }
 
         default_config = {
@@ -1081,10 +1084,37 @@ def get_loadbalance_config():
                 excluded = []
             normalized_excluded = [str(item) for item in excluded if isinstance(item, str)]
 
+            auto_reset = section.get('autoResetMinutes', section.get('auto_reset_minutes', 10))
+            try:
+                auto_reset = int(auto_reset)
+                if auto_reset < 0:
+                    auto_reset = 0
+            except (TypeError, ValueError):
+                auto_reset = 10
+
+            timestamps = section.get('excludedTimestamps', section.get('excluded_timestamps', {}))
+            if not isinstance(timestamps, dict):
+                timestamps = {}
+            normalized_timestamps = {}
+            for name, ts in timestamps.items():
+                try:
+                    numeric_ts = float(ts)
+                except (TypeError, ValueError):
+                    continue
+                if name in normalized_excluded and numeric_ts > 0:
+                    normalized_timestamps[str(name)] = numeric_ts
+
             config['services'][service] = {
                 'failureThreshold': threshold,
                 'currentFailures': normalized_failures,
                 'excludedConfigs': normalized_excluded,
+                'autoResetMinutes': auto_reset,
+                'excludedTimestamps': normalized_timestamps,
+                'manualDisabledUntil': {
+                    str(name): str(value).strip()
+                    for name, value in (section.get('manualDisabledUntil', section.get('manual_disabled_until', {})) or {}).items()
+                    if isinstance(name, str) and str(value).strip()
+                },
             }
 
         return jsonify({'config': config})
@@ -1106,10 +1136,19 @@ def save_loadbalance_config():
             return jsonify({'error': 'Invalid loadbalance mode'}), 400
 
         services = data.get('services', {})
+        lb_config_file = DATA_DIR / 'lb_config.json'
         normalized = {
             'mode': mode,
             'services': {}
         }
+
+        existing_config = {}
+        if lb_config_file.exists():
+            try:
+                with open(lb_config_file, 'r', encoding='utf-8') as f:
+                    existing_config = json.load(f)
+            except Exception:
+                existing_config = {}
 
         for service in ['claude', 'codex']:
             section = services.get(service, {})
@@ -1139,13 +1178,52 @@ def save_loadbalance_config():
                 return jsonify({'error': f'excludedConfigs for service {service} must be an array'}), 400
             normalized_excluded = [str(item) for item in excluded if isinstance(item, str)]
 
+            auto_reset = section.get('autoResetMinutes', section.get('auto_reset_minutes', 10))
+            try:
+                auto_reset = int(auto_reset)
+            except (TypeError, ValueError):
+                return jsonify({'error': f'autoResetMinutes for service {service} must be integer'}), 400
+            if auto_reset < 0:
+                return jsonify({'error': f'autoResetMinutes for service {service} must be >= 0'}), 400
+
+            existing_section = existing_config.get('services', {}).get(service, {}) if isinstance(existing_config, dict) else {}
+            existing_timestamps = existing_section.get('excludedTimestamps', {})
+            if not isinstance(existing_timestamps, dict):
+                existing_timestamps = {}
+            normalized_timestamps = {}
+            for name in normalized_excluded:
+                raw_ts = existing_timestamps.get(name)
+                try:
+                    numeric_ts = float(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                if numeric_ts > 0:
+                    normalized_timestamps[name] = numeric_ts
+
             normalized['services'][service] = {
                 'failureThreshold': threshold,
                 'currentFailures': normalized_failures,
-                'excludedConfigs': normalized_excluded
+                'excludedConfigs': normalized_excluded,
+                'autoResetMinutes': auto_reset,
+                'excludedTimestamps': normalized_timestamps,
+                'manualDisabledUntil': {}
             }
 
-        lb_config_file = DATA_DIR / 'lb_config.json'
+            manual_disabled = section.get('manualDisabledUntil', section.get('manual_disabled_until', {}))
+            if manual_disabled is None:
+                manual_disabled = {}
+            if not isinstance(manual_disabled, dict):
+                return jsonify({'error': f'manualDisabledUntil for service {service} must be an object'}), 400
+
+            normalized_manual = {}
+            for name, value in manual_disabled.items():
+                if not isinstance(name, str):
+                    continue
+                date_str = str(value).strip()
+                if date_str:
+                    normalized_manual[name] = date_str
+
+            normalized['services'][service]['manualDisabledUntil'] = normalized_manual
 
         with open(lb_config_file, 'w', encoding='utf-8') as f:
             json.dump(normalized, f, ensure_ascii=False, indent=2)
@@ -1178,12 +1256,16 @@ def reset_loadbalance_failures():
         services = config.setdefault('services', {})
         service_config = services.setdefault(service, {
             'failureThreshold': 3,
+            'autoResetMinutes': 10,
             'currentFailures': {},
-            'excludedConfigs': []
+            'excludedConfigs': [],
+            'excludedTimestamps': {}
         })
 
         current_failures = service_config.setdefault('currentFailures', {})
         excluded_configs = service_config.setdefault('excludedConfigs', [])
+        excluded_timestamps = service_config.setdefault('excludedTimestamps', {})
+        service_config.setdefault('manualDisabledUntil', {})
 
         if config_name:
             key = str(config_name)
@@ -1191,10 +1273,13 @@ def reset_loadbalance_failures():
                 current_failures[key] = 0
             if key in excluded_configs:
                 excluded_configs.remove(key)
+            if key in excluded_timestamps:
+                excluded_timestamps.pop(key, None)
             message = f'已重置 {service} 服务的 {key} 配置失败计数'
         else:
             service_config['currentFailures'] = {}
             service_config['excludedConfigs'] = []
+            service_config['excludedTimestamps'] = {}
             message = f'已重置 {service} 服务的所有失败计数'
 
         with open(lb_config_file, 'w', encoding='utf-8') as f:

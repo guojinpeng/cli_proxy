@@ -195,13 +195,19 @@ const app = createApp({
             services: {
                 claude: {
                     failureThreshold: 3,
+                    autoResetMinutes: 10,
                     currentFailures: {},
-                    excludedConfigs: []
+                    excludedConfigs: [],
+                    excludedTimestamps: {},
+                    manualDisabledUntil: {}
                 },
                 codex: {
                     failureThreshold: 3,
+                    autoResetMinutes: 10,
                     currentFailures: {},
-                    excludedConfigs: []
+                    excludedConfigs: [],
+                    excludedTimestamps: {},
+                    manualDisabledUntil: {}
                 }
             }
         });
@@ -873,13 +879,19 @@ const app = createApp({
                 services: {
                     claude: {
                         failureThreshold: 3,
+                        autoResetMinutes: 10,
                         currentFailures: {},
-                        excludedConfigs: []
+                        excludedConfigs: [],
+                        excludedTimestamps: {},
+                        manualDisabledUntil: {}
                     },
                     codex: {
                         failureThreshold: 3,
+                        autoResetMinutes: 10,
                         currentFailures: {},
-                        excludedConfigs: []
+                        excludedConfigs: [],
+                        excludedTimestamps: {},
+                        manualDisabledUntil: {}
                     }
                 }
             };
@@ -899,6 +911,38 @@ const app = createApp({
 
                 const excludedList = section.excludedConfigs || section.excluded_configs || [];
                 normalized.services[service].excludedConfigs = Array.isArray(excludedList) ? [...excludedList] : [];
+
+                const autoReset = Number(section.autoResetMinutes ?? section.auto_reset_minutes ?? 10);
+                normalized.services[service].autoResetMinutes = Number.isFinite(autoReset) && autoReset >= 0
+                    ? Math.round(autoReset)
+                    : 0;
+
+                const rawTimestamps = section.excludedTimestamps || section.excluded_timestamps || {};
+                const normalizedTimestamps = {};
+                if (rawTimestamps && typeof rawTimestamps === 'object') {
+                    Object.entries(rawTimestamps).forEach(([name, ts]) => {
+                        const numeric = Number(ts);
+                        if (Number.isFinite(numeric) && numeric > 0 && normalized.services[service].excludedConfigs.includes(name)) {
+                            normalizedTimestamps[name] = numeric;
+                        }
+                    });
+                }
+                normalized.services[service].excludedTimestamps = normalizedTimestamps;
+
+                const manualDisabled = section.manualDisabledUntil || section.manual_disabled_until || {};
+                const normalizedManual = {};
+                if (manualDisabled && typeof manualDisabled === 'object') {
+                    Object.entries(manualDisabled).forEach(([name, dateStr]) => {
+                        if (typeof name !== 'string') {
+                            return;
+                        }
+                        const stringified = (dateStr ?? '').toString().trim();
+                        if (stringified) {
+                            normalizedManual[name] = stringified;
+                        }
+                    });
+                }
+                normalized.services[service].manualDisabledUntil = normalizedManual;
             });
 
             return normalized;
@@ -911,6 +955,9 @@ const app = createApp({
                 loadbalanceConfig.services[service].failureThreshold = svc.failureThreshold;
                 loadbalanceConfig.services[service].currentFailures = Object.assign({}, svc.currentFailures);
                 loadbalanceConfig.services[service].excludedConfigs = [...svc.excludedConfigs];
+                loadbalanceConfig.services[service].autoResetMinutes = svc.autoResetMinutes;
+                loadbalanceConfig.services[service].excludedTimestamps = { ...svc.excludedTimestamps };
+                loadbalanceConfig.services[service].manualDisabledUntil = { ...svc.manualDisabledUntil };
             });
         };
 
@@ -925,10 +972,38 @@ const app = createApp({
                     failuresPayload[name] = Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
                 });
                 const excludedPayload = Array.isArray(section.excludedConfigs) ? [...section.excludedConfigs] : [];
+                const autoReset = Number(section.autoResetMinutes ?? 10);
+                const normalizedAutoReset = Number.isFinite(autoReset) && autoReset >= 0 ? Math.round(autoReset) : 0;
+                const timestampsPayload = {};
+                const rawTimestamps = section.excludedTimestamps || {};
+                if (rawTimestamps && typeof rawTimestamps === 'object') {
+                    excludedPayload.forEach(name => {
+                        const numeric = Number(rawTimestamps[name]);
+                        if (Number.isFinite(numeric) && numeric > 0) {
+                            timestampsPayload[name] = numeric;
+                        }
+                    });
+                }
+                const manualPayload = {};
+                const manualDisabled = section.manualDisabledUntil || {};
+                if (manualDisabled && typeof manualDisabled === 'object') {
+                    Object.entries(manualDisabled).forEach(([name, dateStr]) => {
+                        if (typeof name !== 'string') {
+                            return;
+                        }
+                        const stringified = (dateStr ?? '').toString().trim();
+                        if (stringified) {
+                            manualPayload[name] = stringified;
+                        }
+                    });
+                }
                 return {
                     failureThreshold: normalizedThreshold,
                     currentFailures: failuresPayload,
-                    excludedConfigs: excludedPayload
+                    excludedConfigs: excludedPayload,
+                    autoResetMinutes: normalizedAutoReset,
+                    excludedTimestamps: timestampsPayload,
+                    manualDisabledUntil: manualPayload
                 };
             };
 
@@ -960,6 +1035,7 @@ const app = createApp({
 
         const saveLoadbalanceConfig = async (showSuccess = true) => {
             loadbalanceSaving.value = true;
+            let success = false;
             try {
                 const payload = buildLoadbalancePayload();
                 const result = await fetchWithErrorHandling('/api/loadbalance/config', {
@@ -975,6 +1051,7 @@ const app = createApp({
                         ElMessage.success('负载均衡配置保存成功');
                     }
                     await loadLoadbalanceConfig();
+                    success = true;
                 } else {
                     ElMessage.error('负载均衡配置保存失败: ' + (result.error || '未知错误'));
                 }
@@ -983,6 +1060,7 @@ const app = createApp({
             } finally {
                 loadbalanceSaving.value = false;
             }
+            return success;
         };
 
         const selectLoadbalanceMode = async (mode) => {
@@ -994,13 +1072,55 @@ const app = createApp({
             ElMessage.success(`已切换到${getLoadbalanceModeText(mode)}模式`);
         };
 
+        const getTodayKey = () => {
+            const now = new Date();
+            const pad = (n) => n.toString().padStart(2, '0');
+            return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+        };
+
+        const onAutoResetMinutesChange = async (service, value) => {
+            const numeric = Number(value);
+            const sanitized = Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric) : 0;
+            loadbalanceConfig.services[service].autoResetMinutes = sanitized;
+            const ok = await saveLoadbalanceConfig(false);
+            if (ok) {
+                ElMessage.success('已更新自动重置间隔');
+            }
+        };
+
+        const toggleManualDisableForToday = async (service, configName, enabled) => {
+            const manualMap = loadbalanceConfig.services[service]?.manualDisabledUntil;
+            if (!manualMap) {
+                return;
+            }
+            const todayKey = getTodayKey();
+            const previous = { ...manualMap };
+            if (enabled) {
+                manualMap[configName] = todayKey;
+            } else {
+                delete manualMap[configName];
+            }
+            const ok = await saveLoadbalanceConfig(false);
+            if (ok) {
+                ElMessage.success(enabled ? '已设置今日禁用' : '已取消今日禁用');
+            } else {
+                // 回滚本地修改
+                Object.keys(manualMap).forEach(key => delete manualMap[key]);
+                Object.entries(previous).forEach(([key, value]) => {
+                    manualMap[key] = value;
+                });
+            }
+        };
+
         const weightedTargets = computed(() => {
             const result = { claude: [], codex: [] };
+            const todayKey = getTodayKey();
             ['claude', 'codex'].forEach(service => {
                 const metadata = configMetadata[service] || {};
                 const threshold = loadbalanceConfig.services[service]?.failureThreshold || 3;
                 const failures = loadbalanceConfig.services[service]?.currentFailures || {};
                 const excluded = loadbalanceConfig.services[service]?.excludedConfigs || [];
+                const manualDisabled = loadbalanceConfig.services[service]?.manualDisabledUntil || {};
                 const list = Object.entries(metadata).map(([name, meta]) => {
                     const weight = Number(meta?.weight ?? 0);
                     return {
@@ -1009,6 +1129,8 @@ const app = createApp({
                         failures: failures[name] || 0,
                         threshold,
                         excluded: excluded.includes(name),
+                        disabledToday: manualDisabled[name] === todayKey,
+                        manualDisabledUntil: manualDisabled[name] || '',
                         isActive: services[service].config === name
                     };
                 });
@@ -3716,6 +3838,8 @@ const app = createApp({
             isLoadbalanceWeightMode,
             weightedTargets,
             selectLoadbalanceMode,
+            onAutoResetMinutesChange,
+            toggleManualDisableForToday,
             pinWeightedTarget,
             resetLoadbalanceFailures,
             resettingFailures,

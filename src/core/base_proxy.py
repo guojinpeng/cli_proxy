@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -381,13 +382,19 @@ class BaseProxyService(ABC):
             'services': {
                 'claude': {
                     'failureThreshold': 3,
+                    'autoResetMinutes': 10,
                     'currentFailures': {},
-                    'excludedConfigs': []
+                    'excludedConfigs': [],
+                    'excludedTimestamps': {},
+                    'manualDisabledUntil': {}
                 },
                 'codex': {
                     'failureThreshold': 3,
+                    'autoResetMinutes': 10,
                     'currentFailures': {},
-                    'excludedConfigs': []
+                    'excludedConfigs': [],
+                    'excludedTimestamps': {},
+                    'manualDisabledUntil': {}
                 }
             }
         }
@@ -396,9 +403,131 @@ class BaseProxyService(ABC):
         """确保指定服务的负载均衡配置结构完整"""
         services = config.setdefault('services', {})
         service_section = services.setdefault(service, {})
-        service_section.setdefault('failureThreshold', 3)
-        service_section.setdefault('currentFailures', {})
-        service_section.setdefault('excludedConfigs', [])
+        threshold = service_section.get('failureThreshold', 3)
+        try:
+            threshold = int(threshold)
+        except (TypeError, ValueError):
+            threshold = 3
+        if threshold <= 0:
+            threshold = 3
+        service_section['failureThreshold'] = threshold
+
+        failures = service_section.get('currentFailures', {})
+        if not isinstance(failures, dict):
+            failures = {}
+        normalized_failures = {}
+        for key, value in failures.items():
+            name = str(key)
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                count = 0
+            normalized_failures[name] = max(count, 0)
+        service_section['currentFailures'] = normalized_failures
+
+        excluded = service_section.get('excludedConfigs', [])
+        if not isinstance(excluded, list):
+            excluded = []
+        service_section['excludedConfigs'] = [str(item) for item in excluded if isinstance(item, str)]
+
+        auto_reset = service_section.get('autoResetMinutes', 10)
+        try:
+            auto_reset = int(auto_reset)
+        except (TypeError, ValueError):
+            auto_reset = 10
+        if auto_reset < 0:
+            auto_reset = 0
+        service_section['autoResetMinutes'] = auto_reset
+
+        timestamps = service_section.get('excludedTimestamps', {})
+        if not isinstance(timestamps, dict):
+            timestamps = {}
+        normalized_timestamps = {}
+        for key, value in timestamps.items():
+            name = str(key)
+            try:
+                ts_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if ts_value > 0:
+                normalized_timestamps[name] = ts_value
+        service_section['excludedTimestamps'] = normalized_timestamps
+
+        manual_disabled = service_section.get('manualDisabledUntil', {})
+        if not isinstance(manual_disabled, dict):
+            manual_disabled = {}
+        normalized_manual = {}
+        for key, value in manual_disabled.items():
+            name = str(key)
+            try:
+                date_str = str(value).strip()
+            except Exception:
+                continue
+            if date_str:
+                normalized_manual[name] = date_str
+        service_section['manualDisabledUntil'] = normalized_manual
+
+    def _apply_lb_auto_reset(self, service_section: dict) -> bool:
+        """根据配置自动重置已跳过的目标"""
+        interval_minutes = service_section.get('autoResetMinutes', 0)
+        try:
+            interval_minutes = int(interval_minutes)
+        except (TypeError, ValueError):
+            interval_minutes = 0
+
+        if interval_minutes <= 0:
+            return False
+
+        excluded = service_section.get('excludedConfigs', [])
+        if not excluded:
+            return False
+
+        timestamps = service_section.setdefault('excludedTimestamps', {})
+        failures = service_section.setdefault('currentFailures', {})
+        now = time.time()
+        changed = False
+        expired = []
+
+        for name in list(excluded):
+            ts_value = timestamps.get(name)
+            if not isinstance(ts_value, (int, float)):
+                expired.append(name)
+                continue
+            if now - float(ts_value) >= interval_minutes * 60:
+                expired.append(name)
+
+        for name in expired:
+            if name in excluded:
+                excluded.remove(name)
+            timestamps.pop(name, None)
+            if name in failures and failures[name] != 0:
+                failures[name] = 0
+            changed = True
+
+        return changed
+
+    def _cleanup_manual_disabled(self, service_section: dict) -> bool:
+        """清理已过期的手动禁用项"""
+        manual_disabled = service_section.setdefault('manualDisabledUntil', {})
+        if not isinstance(manual_disabled, dict):
+            service_section['manualDisabledUntil'] = {}
+            return True
+
+        today = datetime.now().date().isoformat()
+        changed = False
+
+        for name in list(manual_disabled.keys()):
+            value = manual_disabled.get(name)
+            if not isinstance(value, str):
+                manual_disabled.pop(name, None)
+                changed = True
+                continue
+            date_str = value.strip()
+            if not date_str or date_str != today:
+                manual_disabled.pop(name, None)
+                changed = True
+
+        return changed
 
     def _load_lb_config(self) -> dict:
         """加载负载均衡配置"""
@@ -538,10 +667,21 @@ class BaseProxyService(ABC):
         if not configs:
             return None
 
-        service_section = self.lb_config.get('services', {}).get(self.service_name, {})
+        self._ensure_lb_service_section(self.lb_config, self.service_name)
+        service_section = self.lb_config['services'][self.service_name]
+        changed = False
+        if self._apply_lb_auto_reset(service_section):
+            changed = True
+        if self._cleanup_manual_disabled(service_section):
+            changed = True
+        if changed:
+            self._persist_lb_config()
+
         threshold = service_section.get('failureThreshold', 3)
         failures = service_section.get('currentFailures', {})
         excluded = set(service_section.get('excludedConfigs', []))
+        manual_disabled = service_section.get('manualDisabledUntil', {})
+        today_key = datetime.now().date().isoformat()
 
         sorted_configs = sorted(
             configs.items(),
@@ -552,6 +692,8 @@ class BaseProxyService(ABC):
             if failures.get(name, 0) >= threshold:
                 continue
             if name in excluded:
+                continue
+            if isinstance(manual_disabled, dict) and manual_disabled.get(name) == today_key:
                 continue
             return name
 
@@ -579,8 +721,14 @@ class BaseProxyService(ABC):
         threshold = service_section.get('failureThreshold', 3)
         failures = service_section.setdefault('currentFailures', {})
         excluded = service_section.setdefault('excludedConfigs', [])
+        timestamps = service_section.setdefault('excludedTimestamps', {})
+        manual_disabled = service_section.setdefault('manualDisabledUntil', {})
 
         changed = False
+        if self._apply_lb_auto_reset(service_section):
+            changed = True
+        if self._cleanup_manual_disabled(service_section):
+            changed = True
         is_success = status_code is not None and 200 <= int(status_code) < 300
 
         if is_success:
@@ -590,6 +738,8 @@ class BaseProxyService(ABC):
             if config_name in excluded:
                 excluded.remove(config_name)
                 changed = True
+            if timestamps.pop(config_name, None) is not None:
+                changed = True
         else:
             new_count = failures.get(config_name, 0) + 1
             if failures.get(config_name) != new_count:
@@ -597,7 +747,15 @@ class BaseProxyService(ABC):
                 changed = True
             if new_count >= threshold and config_name not in excluded:
                 excluded.append(config_name)
+                timestamps[config_name] = time.time()
                 changed = True
+            elif new_count >= threshold:
+                # 已经处于排除列表中，刷新排除时间戳
+                timestamps[config_name] = time.time()
+            else:
+                if config_name in timestamps:
+                    timestamps.pop(config_name, None)
+                    changed = True
 
         if changed:
             self._persist_lb_config()
