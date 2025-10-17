@@ -226,6 +226,18 @@
                                     <i class="el-icon-refresh"></i> 重置失败计数
                                 </el-button>
                             </div>
+                            <div class="lb-settings-row">
+                                <label class="lb-settings-label">自动重置间隔 (分钟)</label>
+                                <el-input-number
+                                    v-model="loadbalanceConfig.services[service].autoResetMinutes"
+                                    :min="0"
+                                    :max="1440"
+                                    :step="1"
+                                    :disabled="loadbalanceSaving"
+                                    @change="value => onAutoResetMinutesChange(service, value)">
+                                </el-input-number>
+                                <span class="lb-settings-hint">默认 10，0 表示不自动重置</span>
+                            </div>
                             <el-empty description="未配置转发目标" v-if="weightedTargets[service].length === 0"></el-empty>
                             <ul class="lb-weight-list" v-else>
                                 <li v-for="(item, index) in weightedTargets[service]"
@@ -237,11 +249,20 @@
                                             {{ item.name }}
                                             <el-tag v-if="item.isActive" size="small" type="info">当前激活</el-tag>
                                             <el-tag v-if="item.excluded" size="small" type="danger" effect="plain">已暂时跳过</el-tag>
+                                            <el-tag v-if="item.disabledToday" size="small" type="warning" effect="plain">今日禁用</el-tag>
                                         </div>
                                         <div class="lb-meta">
                                             权重 {{ item.weight }} · 失败 {{ item.failures }} / {{ item.threshold }}
                                         </div>
                                         <div class="lb-actions">
+                                            <el-checkbox
+                                                class="lb-disable-checkbox"
+                                                :model-value="item.disabledToday"
+                                                size="small"
+                                                :disabled="loadbalanceSaving"
+                                                @change="checked => toggleManualDisableForToday(service, item.name, checked)">
+                                                今日禁用
+                                            </el-checkbox>
                                             <el-button
                                                 type="primary"
                                                 size="small"
