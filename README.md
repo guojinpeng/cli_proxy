@@ -124,6 +124,170 @@ clp active claude prod
 clp active codex dev
 ```
 
+## Docker 部署
+
+### 使用 Docker Compose（推荐）
+
+1. **构建并启动服务**
+```bash
+docker-compose up -d
+```
+
+2. **查看服务状态**
+```bash
+docker-compose ps
+```
+
+3. **查看日志**
+```bash
+docker-compose logs -f
+```
+
+4. **停止服务**
+```bash
+docker-compose down
+```
+
+### 使用 Docker 命令
+
+1. **构建镜像**
+```bash
+docker build -t clp .
+```
+
+2. **运行容器**
+```bash
+docker run -d \
+  --name clp-proxy \
+  -p 3210:3210 \
+  -p 3211:3211 \
+  -p 3300:3300 \
+  -v clp_data:/root/.clp \
+  clp
+```
+
+3. **查看容器状态**
+```bash
+docker ps
+```
+
+4. **查看日志**
+```bash
+docker logs -f clp-proxy
+```
+
+5. **停止容器**
+```bash
+docker stop clp-proxy
+docker rm clp-proxy
+```
+
+### Docker容器内服务管理
+
+```bash
+# 启动所有服务
+docker-compose exec clp python -m src.main start
+
+# 停止所有服务
+docker-compose exec clp python -m src.main stop
+
+# 重启所有服务
+docker-compose exec clp python -m src.main restart
+
+# 查看服务状态
+docker-compose exec clp python -m src.main status
+```
+
+### 容器内配置管理
+
+```bash
+# 列出Claude的所有配置
+docker-compose exec clp python -m src.main list claude
+
+# 列出Codex的所有配置
+docker-compose exec clp python -m src.main list codex
+
+# 激活Claude的prod配置
+docker-compose exec clp python -m src.main active claude prod
+
+# 激活Codex的dev配置
+docker-compose exec clp python -m src.main active codex dev
+```
+
+### 数据持久化
+
+- 配置文件存储在Docker volume `clp_data` 中
+- 包含Claude和Codex的配置、运行日志等数据
+- 容器重启后配置会自动保留
+
+### 端口说明
+
+- **3210**: Claude代理服务端口
+- **3211**: Codex代理服务端口
+- **3300**: Web UI管理界面端口
+
+### 健康检查
+
+容器内置健康检查，会定期检查Web UI服务是否正常运行：
+
+```bash
+# 查看健康状态
+docker-compose ps
+# 或者
+docker inspect clp-proxy | grep Health -A 10
+```
+
+### 故障排除
+
+#### 查看详细日志
+```bash
+docker-compose logs clp
+```
+
+#### 进入容器调试
+```bash
+docker-compose exec clp /bin/bash
+```
+
+#### 重新构建镜像
+```bash
+docker-compose build --no-cache
+```
+
+#### 清理数据
+```bash
+# 停止并删除容器
+docker-compose down
+
+# 删除数据volume（谨慎操作）
+docker volume rm clp_clp_data
+```
+
+### 开发环境
+
+如果需要在开发环境使用Docker，可以挂载源代码：
+
+```bash
+docker run -d \
+  --name clp-dev \
+  -p 3210:3210 \
+  -p 3211:3211 \
+  -p 3300:3300 \
+  -v $(pwd)/src:/app/src \
+  -v clp_dev_data:/root/.clp \
+  clp
+```
+
+### 更新版本
+
+```bash
+# 拉取最新代码
+git pull
+
+# 重新构建并启动
+docker-compose up -d --build
+```
+
 ### claude code 使用方法
 1. 修改 `~/.claude/settings.json` Claude配置文件，连接本地CLI代理服务
 ```json

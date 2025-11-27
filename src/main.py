@@ -173,13 +173,26 @@ def main():
     
     # ui 命令
     ui_parser = subparsers.add_parser(
-        'ui', 
+        'ui',
         help='启动Web UI界面',
         description='启动Web UI界面来可视化代理状态',
         formatter_class=common_formatter,
         epilog="""示例:
   clp ui                        启动UI界面(默认端口3300)"""
     )
+
+    # server 命令
+    server_parser = subparsers.add_parser(
+        'server',
+        help='启动服务器模式',
+        description='启动所有代理服务并在前台持久运行',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  clp server                    启动服务器模式（所有服务后台运行，UI前台持久运行）
+  clp server --detach           启动服务后退出（非持久运行）"""
+    )
+    server_parser.add_argument('--detach', action='store_true',
+                              help='启动服务后退出，不保持前台运行')
 
     # 解析参数
     args = parser.parse_args()
@@ -251,6 +264,45 @@ def main():
     elif args.command == 'ui':
         import webbrowser
         webbrowser.open("http://localhost:3300")
+    elif args.command == 'server':
+        print("正在启动服务器模式...")
+
+        # 启动 Claude 和 Codex 服务（后台）
+        print("启动 Claude 代理服务...")
+        claude.start()
+        print("启动 Codex 代理服务...")
+        codex.start()
+
+        # 等待服务启动
+        time.sleep(2)
+
+        print("所有后台服务启动完成！")
+        print("- Claude 代理: http://localhost:3210")
+        print("- Codex 代理: http://localhost:3211")
+
+        if not args.detach:
+            print("启动 UI 服务（前台持久运行）...")
+            print("- UI 界面: http://localhost:3300")
+            print("按 Ctrl+C 停止所有服务")
+
+            try:
+                # UI 服务在前台运行（保持进程活跃）
+                # 直接调用UI服务器，不使用守护进程模式
+                from src.ui.ui_server import start_ui_server
+                start_ui_server(3300)
+            except KeyboardInterrupt:
+                print("\n正在停止所有服务...")
+                claude.stop()
+                codex.stop()
+                ui.stop()
+                print("所有服务已停止")
+        else:
+            print("启动 UI 服务（后台运行）...")
+            ui.start()
+            print("所有服务已启动并后台运行")
+
+            # 显示服务状态
+            print_status()
     else:
         parser.print_help()
 
