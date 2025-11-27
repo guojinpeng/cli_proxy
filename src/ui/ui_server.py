@@ -1,11 +1,11 @@
+import copy
 import json
-import webbrowser
 import time
-import json
 from pathlib import Path
-from typing import Any, Dict
-from flask import Flask, jsonify, send_file, request
-import os
+from threading import Event, RLock, Thread
+from typing import Any, Dict, Optional, Tuple
+
+from flask import Flask, jsonify, request, send_file
 
 from src.utils.usage_parser import (
     METRIC_KEYS,
@@ -32,6 +32,158 @@ if OLD_LOG_FILE.exists() and not LOG_FILE.exists():
         pass
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path='/static')
+
+
+def _resolve_log_path() -> Optional[Path]:
+    if LOG_FILE.exists():
+        return LOG_FILE
+    if OLD_LOG_FILE.exists():
+        return OLD_LOG_FILE
+    return None
+
+
+def _get_file_signature(path: Optional[Path]) -> Tuple[int, int]:
+    if path is None:
+        return (0, 0)
+    try:
+        stat_result = path.stat()
+        return stat_result.st_mtime_ns, stat_result.st_size
+    except (FileNotFoundError, OSError):
+        return (0, 0)
+
+
+_LOGS_CACHE_LOCK = RLock()
+_LOGS_CACHE: Dict[str, Any] = {
+    'path': None,
+    'signature': (0, 0),
+    'logs': [],
+}
+
+_HISTORY_CACHE_LOCK = RLock()
+_HISTORY_CACHE: Dict[str, Any] = {
+    'signature': (0, 0),
+    'history': {},
+}
+
+_USAGE_SNAPSHOT_CACHE_LOCK = RLock()
+_USAGE_SNAPSHOT_CACHE: Dict[str, Any] = {
+    'log_key': (None, (0, 0)),
+    'history_signature': (0, 0),
+    'data': None,
+}
+
+_USAGE_SUMMARY_CACHE_LOCK = RLock()
+_USAGE_SUMMARY_CACHE: Dict[str, Any] = {
+    'log_key': (None, (0, 0)),
+    'history_signature': (0, 0),
+    'summary': None,
+    'request_count': 0,
+    'timestamp': None,
+}
+_USAGE_SUMMARY_READY = Event()
+_USAGE_REFRESH_EVENT = Event()
+_USAGE_REFRESH_THREAD: Optional[Thread] = None
+
+
+def _build_usage_summary_payload(
+    combined_usage: Dict[str, Dict[str, Dict[str, int]]]
+) -> Dict[str, Any]:
+    service_usage_totals: Dict[str, Dict[str, int]] = {}
+    for service_name, channels in combined_usage.items():
+        service_usage_totals[service_name] = compute_total_metrics(channels)
+
+    for expected_service in ('claude', 'codex'):
+        service_usage_totals.setdefault(expected_service, empty_metrics())
+
+    overall_totals = empty_metrics()
+    for totals in service_usage_totals.values():
+        merge_usage_metrics(overall_totals, totals)
+
+    return {
+        'totals': overall_totals,
+        'formatted_totals': format_metrics(overall_totals),
+        'per_service': {
+            service: {
+                'metrics': totals,
+                'formatted': format_metrics(totals)
+            }
+            for service, totals in service_usage_totals.items()
+        }
+    }
+
+
+def _refresh_usage_summary(force: bool = False) -> None:
+    log_path = _resolve_log_path()
+    log_key = (str(log_path.resolve()), _get_file_signature(log_path)) if log_path else (None, (0, 0))
+    history_signature = _get_file_signature(HISTORY_FILE if HISTORY_FILE.exists() else None)
+
+    with _USAGE_SUMMARY_CACHE_LOCK:
+        cache_key = _USAGE_SUMMARY_CACHE['log_key']
+        cache_history = _USAGE_SUMMARY_CACHE['history_signature']
+        cache_summary = _USAGE_SUMMARY_CACHE['summary']
+        if not force and cache_summary is not None and cache_key == log_key and cache_history == history_signature:
+            _USAGE_SUMMARY_READY.set()
+            return
+        _USAGE_SUMMARY_READY.clear()
+
+    logs = load_logs()
+    history_usage = load_history_usage()
+    current_usage = aggregate_usage_from_logs(logs)
+    combined_usage = combine_usage_maps(current_usage, history_usage)
+    summary_payload = _build_usage_summary_payload(combined_usage)
+    request_count = len(logs)
+    timestamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+
+    with _USAGE_SUMMARY_CACHE_LOCK:
+        _USAGE_SUMMARY_CACHE['log_key'] = log_key
+        _USAGE_SUMMARY_CACHE['history_signature'] = history_signature
+        _USAGE_SUMMARY_CACHE['summary'] = summary_payload
+        _USAGE_SUMMARY_CACHE['request_count'] = request_count
+        _USAGE_SUMMARY_CACHE['timestamp'] = timestamp
+        _USAGE_SUMMARY_READY.set()
+
+
+def _usage_summary_worker():
+    while True:
+        triggered = _USAGE_REFRESH_EVENT.wait(timeout=5.0)
+        _USAGE_REFRESH_EVENT.clear()
+        try:
+            _refresh_usage_summary(force=triggered)
+        except Exception as exc:
+            print(f"Usage summary refresh failed: {exc}")
+            _USAGE_SUMMARY_READY.set()
+
+
+def _ensure_usage_summary_worker_started():
+    global _USAGE_REFRESH_THREAD
+    if _USAGE_REFRESH_THREAD is not None:
+        return
+    _USAGE_REFRESH_THREAD = Thread(target=_usage_summary_worker, name='usage-summary-worker', daemon=True)
+    _USAGE_REFRESH_THREAD.start()
+    _USAGE_REFRESH_EVENT.set()
+
+
+def _trigger_usage_summary_refresh(async_mode: bool = False) -> None:
+    _ensure_usage_summary_worker_started()
+    if async_mode:
+        _USAGE_REFRESH_EVENT.set()
+    else:
+        _refresh_usage_summary(force=True)
+
+
+_ensure_usage_summary_worker_started()
+
+
+def _get_cached_usage_summary(timeout: float = 0.5) -> Tuple[Optional[Dict[str, Any]], int, Optional[str]]:
+    _ensure_usage_summary_worker_started()
+    _USAGE_SUMMARY_READY.wait(timeout=timeout)
+    with _USAGE_SUMMARY_CACHE_LOCK:
+        summary = _USAGE_SUMMARY_CACHE['summary']
+        request_count = _USAGE_SUMMARY_CACHE['request_count']
+        timestamp = _USAGE_SUMMARY_CACHE['timestamp']
+
+    summary_copy = copy.deepcopy(summary) if summary is not None else None
+    return summary_copy, int(request_count or 0), timestamp
 
 
 def _safe_json_load(line: str) -> Dict[str, Any]:
@@ -139,6 +291,7 @@ def _rename_log_channels(service: str, rename_map: Dict[str, str]) -> None:
         raise
 
     temp_path.replace(LOG_FILE)
+    _trigger_usage_summary_refresh(async_mode=True)
 
 
 def _sync_router_config_names(service: str, rename_map: Dict[str, str]) -> None:
@@ -379,15 +532,26 @@ def trim_logs_to_limit(limit: int) -> None:
         for log in trimmed_logs:
             f.write(json.dumps(log, ensure_ascii=False) + '\n')
 
+    _trigger_usage_summary_refresh(async_mode=True)
+
 
 def load_logs() -> list[Dict[str, Any]]:
-    logs: list[Dict[str, Any]] = []
-    log_path = LOG_FILE if LOG_FILE.exists() else (
-        OLD_LOG_FILE if OLD_LOG_FILE.exists() else None
-    )
+    log_path = _resolve_log_path()
     if log_path is None:
-        return logs
+        with _LOGS_CACHE_LOCK:
+            _LOGS_CACHE['path'] = None
+            _LOGS_CACHE['signature'] = (0, 0)
+            _LOGS_CACHE['logs'] = []
+        return []
 
+    resolved_path = str(log_path.resolve())
+    signature = _get_file_signature(log_path)
+
+    with _LOGS_CACHE_LOCK:
+        if _LOGS_CACHE['path'] == resolved_path and _LOGS_CACHE['signature'] == signature:
+            return list(_LOGS_CACHE['logs'])
+
+    logs: list[Dict[str, Any]] = []
     with open(log_path, 'r', encoding='utf-8') as f:
         for raw_line in f:
             line = raw_line.strip()
@@ -399,17 +563,38 @@ def load_logs() -> list[Dict[str, Any]]:
             service = entry.get('service') or entry.get('usage', {}).get('service') or 'unknown'
             entry['usage'] = normalize_usage_record(service, entry.get('usage'))
             logs.append(entry)
-    return logs
+
+    with _LOGS_CACHE_LOCK:
+        _LOGS_CACHE['path'] = resolved_path
+        _LOGS_CACHE['signature'] = signature
+        _LOGS_CACHE['logs'] = logs
+
+    return list(logs)
 
 
 def load_history_usage() -> Dict[str, Dict[str, Dict[str, int]]]:
+    signature = _get_file_signature(HISTORY_FILE if HISTORY_FILE.exists() else None)
+
+    with _HISTORY_CACHE_LOCK:
+        if _HISTORY_CACHE['signature'] == signature:
+            return _HISTORY_CACHE['history']
+
     if not HISTORY_FILE.exists():
-        return {}
+        history: Dict[str, Dict[str, Dict[str, int]]] = {}
+        with _HISTORY_CACHE_LOCK:
+            _HISTORY_CACHE['signature'] = signature
+            _HISTORY_CACHE['history'] = history
+        return history
+
     try:
         with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
-        return {}
+        history = {}
+        with _HISTORY_CACHE_LOCK:
+            _HISTORY_CACHE['signature'] = signature
+            _HISTORY_CACHE['history'] = history
+        return history
 
     history: Dict[str, Dict[str, Dict[str, int]]] = {}
     for service, channels in (data or {}).items():
@@ -422,6 +607,11 @@ def load_history_usage() -> Dict[str, Dict[str, Dict[str, int]]]:
                 merge_usage_metrics(normalized, metrics)
             service_bucket[channel] = normalized
         history[service] = service_bucket
+
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE['signature'] = signature
+        _HISTORY_CACHE['history'] = history
+
     return history
 
 
@@ -435,6 +625,27 @@ def save_history_usage(data: Dict[str, Dict[str, Dict[str, int]]]) -> None:
     }
     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+    normalized_history: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for service, channels in serializable.items():
+        service_bucket: Dict[str, Dict[str, int]] = {}
+        for channel, metrics in channels.items():
+            normalized_metrics = empty_metrics()
+            merge_usage_metrics(normalized_metrics, metrics)
+            service_bucket[channel] = normalized_metrics
+        normalized_history[service] = service_bucket
+
+    signature = _get_file_signature(HISTORY_FILE)
+
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE['signature'] = signature
+        _HISTORY_CACHE['history'] = normalized_history
+
+    with _USAGE_SNAPSHOT_CACHE_LOCK:
+        _USAGE_SNAPSHOT_CACHE['data'] = None
+        _USAGE_SNAPSHOT_CACHE['history_signature'] = signature
+
+    _trigger_usage_summary_refresh(async_mode=True)
 
 
 def aggregate_usage_from_logs(logs: list[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, int]]]:
@@ -494,16 +705,37 @@ def format_metrics(metrics: Dict[str, int]) -> Dict[str, str]:
 
 
 def build_usage_snapshot() -> Dict[str, Any]:
+    log_path = _resolve_log_path()
+    log_key = (str(log_path.resolve()), _get_file_signature(log_path)) if log_path else (None, (0, 0))
+    history_signature = _get_file_signature(HISTORY_FILE if HISTORY_FILE.exists() else None)
+
+    with _USAGE_SNAPSHOT_CACHE_LOCK:
+        cached_data = _USAGE_SNAPSHOT_CACHE['data']
+        if (
+            cached_data is not None
+            and _USAGE_SNAPSHOT_CACHE['log_key'] == log_key
+            and _USAGE_SNAPSHOT_CACHE['history_signature'] == history_signature
+        ):
+            return cached_data
+
     logs = load_logs()
     current_usage = aggregate_usage_from_logs(logs)
     history_usage = load_history_usage()
     combined_usage = combine_usage_maps(current_usage, history_usage)
-    return {
+
+    snapshot = {
         'logs': logs,
         'current_usage': current_usage,
         'history_usage': history_usage,
         'combined_usage': combined_usage
     }
+
+    with _USAGE_SNAPSHOT_CACHE_LOCK:
+        _USAGE_SNAPSHOT_CACHE['log_key'] = log_key
+        _USAGE_SNAPSHOT_CACHE['history_signature'] = history_signature
+        _USAGE_SNAPSHOT_CACHE['data'] = snapshot
+
+    return snapshot
 
 @app.route('/')
 def index():
@@ -538,33 +770,7 @@ def get_status():
         codex_configs = len(codex_config_manager.configs)
         total_configs = claude_configs + codex_configs
         
-        usage_snapshot = build_usage_snapshot()
-        logs = usage_snapshot['logs']
-        request_count = len(logs)
-        combined_usage = usage_snapshot['combined_usage']
-
-        service_usage_totals: Dict[str, Dict[str, int]] = {}
-        for service_name, channels in combined_usage.items():
-            service_usage_totals[service_name] = compute_total_metrics(channels)
-
-        for expected_service in ('claude', 'codex'):
-            service_usage_totals.setdefault(expected_service, empty_metrics())
-
-        overall_totals = empty_metrics()
-        for totals in service_usage_totals.values():
-            merge_usage_metrics(overall_totals, totals)
-
-        usage_summary = {
-            'totals': overall_totals,
-            'formatted_totals': format_metrics(overall_totals),
-            'per_service': {
-                service: {
-                    'metrics': totals,
-                    'formatted': format_metrics(totals)
-                }
-                for service, totals in service_usage_totals.items()
-            }
-        }
+        usage_summary, request_count, summary_timestamp = _get_cached_usage_summary()
         
         # 计算过滤规则数量
         filter_file = Path.home() / '.clp' / 'filter.json'
@@ -597,7 +803,8 @@ def get_status():
             'config_count': total_configs,
             'filter_count': filter_count,
             'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S'),
-            'usage_summary': usage_summary
+            'usage_summary': usage_summary,
+            'summary_timestamp': summary_timestamp
         }
         
         return jsonify(data)
@@ -787,7 +994,9 @@ def clear_logs():
         log_path.write_text('', encoding='utf-8')
         if log_path != LOG_FILE:
             LOG_FILE.touch(exist_ok=True)
-        
+
+        _trigger_usage_summary_refresh(async_mode=True)
+
         return jsonify({'success': True, 'message': '日志已清空'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -855,6 +1064,8 @@ def clear_usage():
 
         # 2. 清空 history_usage.json 中的所有数值
         save_history_usage({"claude": {}, "codex":{}})
+
+        _trigger_usage_summary_refresh(async_mode=True)
 
         return jsonify({'success': True, 'message': 'Token使用记录已清空'})
     except Exception as e:

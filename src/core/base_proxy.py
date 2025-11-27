@@ -6,7 +6,9 @@
 import asyncio
 import base64
 import json
+import os
 import subprocess
+import socket
 import sys
 import time
 import uuid
@@ -45,9 +47,9 @@ class BaseProxyService(ABC):
         self.port = port
         self.config_manager = config_manager
 
-        # 初始化路径
+        # 初始化路径并收紧权限
         self.config_dir = Path.home() / '.clp/run'
-        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_secure_directory(self.config_dir)
         self.pid_file = self.config_dir / f'{service_name}_proxy.pid'
         self.log_file = self.config_dir / f'{service_name}_proxy.log'
 
@@ -96,6 +98,16 @@ class BaseProxyService(ABC):
             from ..filter.request_filter import filter_request_data
             self.filter_request_data = filter_request_data
             self.request_filter = None
+    
+    @staticmethod
+    def _ensure_secure_directory(directory: Path):
+        """确保目录存在并设置仅用户访问权限"""
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            # 在部分平台/文件系统上可能无法chmod，忽略
+            pass
     
     def _create_async_client(self) -> httpx.AsyncClient:
         """创建并配置 httpx AsyncClient"""
@@ -1098,6 +1110,44 @@ class BaseServiceController(ABC):
         self.pid_file = self.config_dir / f'{service_name}_proxy.pid'
         self.log_file = self.config_dir / f'{service_name}_proxy.log'
     
+    @staticmethod
+    def _ensure_secure_directory(directory: Path):
+        """确保运行目录存在且权限安全"""
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            # 在部分平台可能不支持 chmod，忽略即可
+            pass
+
+    def _write_pid_file(self, pid: int):
+        """以受限权限写入 PID 文件"""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(self.pid_file, flags, 0o600)
+        with os.fdopen(fd, 'w') as pid_handle:
+            pid_handle.write(str(pid))
+
+    @staticmethod
+    def _is_port_open(port: int, host: str = '127.0.0.1') -> bool:
+        """检查端口是否可用"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            try:
+                return sock.connect_ex((host, port)) == 0
+            except OSError:
+                return False
+
+    def _wait_for_service_ready(self, port: int, timeout: float = 10.0, interval: float = 0.2) -> bool:
+        """轮询等待服务就绪。若进程不在运行，立即失败；若在运行则等待端口就绪。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.is_running():
+                return False
+            if self._is_port_open(port):
+                return True
+            time.sleep(interval)
+        return self.is_running() and self._is_port_open(port)
+    
     def get_pid(self) -> Optional[int]:
         """获取服务进程PID"""
         if self.pid_file.exists():
@@ -1119,7 +1169,7 @@ class BaseServiceController(ABC):
                 return False
         return False
     
-    def start(self) -> bool:
+    def start(self, port: Optional[int] = None) -> bool:
         """启动服务"""
         if self.is_running():
             print(f"{self.service_name}服务已经在运行")
@@ -1140,15 +1190,16 @@ class BaseServiceController(ABC):
             else:
                 print(f"警告: 未检测到{self.service_name}配置文件，将以占位模式启动。")
         
-        import os
         project_root = Path(__file__).parent.parent.parent
         env = os.environ.copy()
+        original_port = self.port
+        target_port = port if port is not None else self.port
         
         uvicorn_cmd = [
             sys.executable, '-m', 'uvicorn',
             f'{self.proxy_module_path}:app',
             '--host', '0.0.0.0',
-            '--port', str(self.port),
+            '--port', str(target_port),
             '--http', 'h11',
             '--timeout-keep-alive', '60',
             '--limit-concurrency', '500',
@@ -1163,17 +1214,19 @@ class BaseServiceController(ABC):
             )
 
         # 保存PID
-        self.pid_file.write_text(str(process.pid))
+        self._write_pid_file(process.pid)
 
-        # 等待服务启动
-        time.sleep(1)
-
-        if self.is_running():
+        if self._wait_for_service_ready(target_port):
+            self.port = target_port
             print(f"{self.service_name}服务启动成功 (端口: {self.port})")
             return True
-        else:
-            print(f"{self.service_name}服务启动失败")
-            return False
+
+        # 启动失败，恢复端口并清理 PID 文件
+        self.port = original_port
+        if self.pid_file.exists():
+            self.pid_file.unlink()
+        print(f"{self.service_name}服务启动失败")
+        return False
     
     def stop(self) -> bool:
         """停止服务"""
@@ -1203,17 +1256,21 @@ class BaseServiceController(ABC):
         
         return False
     
-    def restart(self) -> bool:
+    def restart(self, port: Optional[int] = None) -> bool:
         """重启服务"""
         self.stop()
         time.sleep(1)
-        return self.start()
+        return self.start(port=port)
     
-    def status(self):
-        """查看服务状态"""
-        if self.is_running():
-            pid = self.get_pid()
-            active_config = self.config_manager.active_config
-            print(f"{self.service_name}服务: 运行中 (PID: {pid}, 配置: {active_config})")
-        else:
-            print(f"{self.service_name}服务: 未运行")
+    def status(self) -> Dict[str, Any]:
+        """返回服务状态信息"""
+        running = self.is_running()
+        pid = self.get_pid() if running else None
+        active_config = self.config_manager.active_config
+        return {
+            'service': self.service_name,
+            'running': running,
+            'pid': pid,
+            'active_config': active_config,
+            'port': self.port,
+        }
