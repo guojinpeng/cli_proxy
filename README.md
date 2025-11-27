@@ -80,7 +80,7 @@ src/
 
 ### 安装
 ```bash
-pip install --user --force-reinstall ./dist/clp-1.9.4-py3-none-any.whl
+pip install --user --force-reinstall ./dist/clp-1.9.5-py3-none-any.whl
 # 更新后需要重启服务新功能才生效（先杀掉clp占用的三个端口保险一点）
 # macOS / Linux
 lsof -ti:3210,3211,3300 | xargs kill -9
@@ -310,19 +310,19 @@ docker-compose up -d --build
 
 ### codex 使用方法
 1. 修改 `~/.codex/config.toml` Codex配置文件，连接本地CLI代理服务
-```properties
-model_provider = "local"
-model = "gpt-5-codex"
-model_reasoning_effort = "high"
-model_reasoning_summary_format = "experimental"
-network_access = "enabled"
-disable_response_storage = true
-show_raw_agent_reasoning = true
 
-[model_providers.local]
-name = "local"
-base_url = "http://127.0.0.1:3211"
-wire_api = "responses"
+```properties
+model_provider="local"
+model="gpt-5-codex"
+model_reasoning_effort="high"
+model_reasoning_summary_format="experimental"
+network_access="enabled"
+disable_response_storage=true
+show_raw_agent_reasoning=true
+[model_providers.local]=
+name="local"
+base_url="http://127.0.0.1:3211"
+wire_api="responses"
 ```
 2. 修改 `~/.codex/auth.json` (没有就创建一个)
 ```json
